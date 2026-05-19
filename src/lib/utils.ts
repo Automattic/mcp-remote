@@ -451,16 +451,14 @@ export async function connectToRemoteServer(
       await client.connect(transport)
     } else {
       debugLog('Starting transport directly')
-      await transport.start()
       if (!sseTransport) {
-        // Extremely hacky, but we didn't actually send a request when calling transport.start() above, so we don't
-        // know if we're even talking to an HTTP server. But if we forced that now we'd get an error later saying that
-        // the client is already connected. So let's just create a one-off client to make a single request and figure
-        // out if we're actually talking to an HTTP server or not.
-        debugLog('Creating test transport for HTTP-only connection test')
-        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
+        // Run the HTTP probe through the main transport so `_resourceMetadataUrl`
+        // captured from the 401's WWW-Authenticate header is available to
+        // `finishAuth` below. See geelen/mcp-remote#231.
         const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
-        await testClient.connect(testTransport)
+        await testClient.connect(transport)
+      } else {
+        await transport.start()
       }
     }
     log(`Connected to remote server using ${transport.constructor.name}`)
@@ -533,23 +531,7 @@ export async function connectToRemoteServer(
         log('Completing authorization...')
         await transport.finishAuth(code)
         debugLog('Authorization completed successfully')
-
-        if (recursionReasons.has(REASON_AUTH_NEEDED)) {
-          const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
-          log(errorMessage)
-          debugLog('Already attempted auth reconnection, giving up', {
-            recursionReasons: Array.from(recursionReasons),
-          })
-          throw new Error(errorMessage)
-        }
-
-        // Track this reason for recursion
-        recursionReasons.add(REASON_AUTH_NEEDED)
-        log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)
-        debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
-
-        // Recursively call connectToRemoteServer with the updated recursion tracking
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        return transport
       } catch (authError: any) {
         log('Authorization error:', authError)
         debugLog('Authorization error during finishAuth', {
