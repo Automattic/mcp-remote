@@ -14,6 +14,13 @@ import express from 'express'
 // All sanitizeUrl tests have been moved to the strict-url-sanitise package
 
 describe('Feature: Command Line Arguments Parsing', () => {
+  // parseCommandLineArgs mutates global.fetch when --socks-proxy or --enable-proxy is passed.
+  // Snapshot once and restore after every test so the alias can't leak into later tests.
+  const originalGlobalFetch = global.fetch
+  afterEach(() => {
+    global.fetch = originalGlobalFetch
+  })
+
   it('Scenario: Parse basic server URL', async () => {
     // Given command line arguments with only a server URL
     const args = ['https://example.com/sse']
@@ -504,6 +511,42 @@ describe('Feature: Command Line Arguments Parsing', () => {
       expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('SOCKS proxy enabled'))
     } finally {
       setGlobalDispatcher(originalDispatcher)
+      consoleSpy.mockRestore()
+    }
+  })
+
+  it('Scenario: --socks-proxy aliases global.fetch to npm undici fetch', async () => {
+    const undici = await import('undici')
+    const { getGlobalDispatcher, setGlobalDispatcher } = undici
+    const originalDispatcher = getGlobalDispatcher()
+    const originalFetch = global.fetch
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const args = ['https://example.com/sse', '--socks-proxy', 'socks5://127.0.0.1:1080']
+      await parseCommandLineArgs(args, 'test usage')
+
+      expect(global.fetch).toBe(undici.fetch)
+    } finally {
+      setGlobalDispatcher(originalDispatcher)
+      global.fetch = originalFetch
+      consoleSpy.mockRestore()
+    }
+  })
+
+  it('Scenario: --enable-proxy aliases global.fetch to npm undici fetch', async () => {
+    const undici = await import('undici')
+    const { getGlobalDispatcher, setGlobalDispatcher } = undici
+    const originalDispatcher = getGlobalDispatcher()
+    const originalFetch = global.fetch
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const args = ['https://example.com/sse', '--enable-proxy']
+      await parseCommandLineArgs(args, 'test usage')
+
+      expect(global.fetch).toBe(undici.fetch)
+    } finally {
+      setGlobalDispatcher(originalDispatcher)
+      global.fetch = originalFetch
       consoleSpy.mockRestore()
     }
   })

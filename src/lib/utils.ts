@@ -93,9 +93,7 @@ export function log(str: string, ...rest: unknown[]) {
 const SENSITIVE_HEADER_PATTERN = /auth|cookie|api[-_]?key|token|secret|password|credential/i
 
 export function redactSensitiveHeaders(headers: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(headers).map(([key, value]) => [key, SENSITIVE_HEADER_PATTERN.test(key) ? '[REDACTED]' : value]),
-  )
+  return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, SENSITIVE_HEADER_PATTERN.test(key) ? '[REDACTED]' : value]))
 }
 
 type Message = any
@@ -801,6 +799,9 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   if (enableProxy) {
     // Use env proxy
     setGlobalDispatcher(new EnvHttpProxyAgent())
+    // On Node 22+, global.fetch uses Node's built-in undici, a separate instance from npm undici.
+    // Alias it so setGlobalDispatcher (npm undici) applies to SDK transports calling global.fetch.
+    global.fetch = fetch as unknown as typeof global.fetch
     log('HTTP proxy support enabled - using system HTTP_PROXY/HTTPS_PROXY environment variables')
   }
 
@@ -809,6 +810,9 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     try {
       const dispatcher = createSocksDispatcher(socksUrl)
       setGlobalDispatcher(dispatcher)
+      // On Node 22+, global.fetch uses Node's built-in undici, a separate instance from npm undici.
+      // Alias it so setGlobalDispatcher (npm undici) applies to SDK transports calling global.fetch.
+      global.fetch = fetch as unknown as typeof global.fetch
       log(`SOCKS proxy enabled: ${redactProxyUrl(socksUrl)}`)
     } catch (err) {
       log(`Error: Invalid --socks-proxy URL: ${err instanceof Error ? err.message : String(err)}`)
