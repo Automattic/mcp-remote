@@ -451,14 +451,33 @@ export async function connectToRemoteServer(
       await client.connect(transport)
     } else {
       debugLog('Starting transport directly')
+      await transport.start()
       if (!sseTransport) {
-        // Run the HTTP probe through the main transport so `_resourceMetadataUrl`
-        // captured from the 401's WWW-Authenticate header is available to
-        // `finishAuth` below. See geelen/mcp-remote#231.
+        // Probe via a throwaway transport so a successful initialize doesn't leak its
+        // Mcp-Session-Id onto the main transport — SDK-stateful servers reject a second
+        // initialize on an existing session ("400 Server already initialized").
+        // On failure (401), copy `_resourceMetadataUrl` from the throwaway to the main
+        // transport so `finishAuth` below can use the per-server PRM URL captured from
+        // the WWW-Authenticate header (geelen/mcp-remote#231).
+        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
         const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
-        await testClient.connect(transport)
-      } else {
-        await transport.start()
+        try {
+          await testClient.connect(testTransport)
+        } catch (probeError) {
+          ;(transport as unknown as { _resourceMetadataUrl?: URL })._resourceMetadataUrl = (
+            testTransport as unknown as { _resourceMetadataUrl?: URL }
+          )._resourceMetadataUrl
+          throw probeError
+        }
+        // Probe succeeded: tear down the throwaway transport's session (DELETE) and abort any
+        // SSE stream the SDK may have started after notifications/initialized. Best-effort —
+        // servers may respond 405 to DELETE (allowed by spec) or be otherwise uncooperative.
+        try {
+          await testTransport.terminateSession()
+        } catch (terminateError) {
+          debugLog('Failed to terminate probe session (non-fatal)', { error: String(terminateError) })
+        }
+        await testClient.close()
       }
     }
     log(`Connected to remote server using ${transport.constructor.name}`)
@@ -541,11 +560,18 @@ export async function connectToRemoteServer(
           throw new Error(errorMessage)
         }
 
-        // SSE transports throw UnauthorizedError from start() itself, before Client.connect's
-        // initialize try/catch can run `void this.close()`. Detach the failed transport so the
-        // recursive call's `client.connect(newTransport)` doesn't hit "Already connected".
-        // No-op on the HTTP path where the SDK already cleared `_transport`.
-        await client?.close()
+        // Close the failed transport before recursing so the recursive call's fresh
+        // transport doesn't share state with this one (Client) and so the AbortController
+        // / EventSource opened by the initial start() isn't leaked (proxy path, client=null).
+        // For the client path, SSE transports specifically throw UnauthorizedError from
+        // start() before Client.connect's initialize try/catch can run `void this.close()`,
+        // which would otherwise leave the failed transport attached and the recursive
+        // `client.connect(newTransport)` would hit "Already connected".
+        if (client) {
+          await client.close()
+        } else {
+          await transport.close()
+        }
 
         recursionReasons.add(REASON_AUTH_NEEDED)
         log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)

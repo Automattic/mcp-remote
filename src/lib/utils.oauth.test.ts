@@ -24,8 +24,8 @@ class MockServer {
     this.app.use(express.urlencoded({ extended: true }))
   }
 
-  on(method: 'GET' | 'POST', routePath: string, handler: express.RequestHandler) {
-    this.app[method.toLowerCase() as 'get' | 'post'](routePath, handler)
+  on(method: 'GET' | 'POST' | 'DELETE', routePath: string, handler: express.RequestHandler) {
+    this.app[method.toLowerCase() as 'get' | 'post' | 'delete'](routePath, handler)
   }
 
   async start() {
@@ -185,5 +185,85 @@ describe('Feature: OAuth flow end-to-end', () => {
     expect(unauthenticatedPosts).toBe(1)
 
     await client.close()
+  }, 15_000)
+
+  it('Scenario: proxy-path probe does not leak Mcp-Session-Id to the main transport', async () => {
+    // Mimics an SDK-stateful server: every initialize response stamps an Mcp-Session-Id,
+    // and a second initialize that arrives with one is rejected. If the probe leaks the
+    // session id onto the transport that the proxy will use, the first forwarded
+    // initialize fails with 400.
+    let initializeCount = 0
+    let probeSessionId: string | undefined
+    const terminatedSessionIds: string[] = []
+    mcp.on('DELETE', '/mcp', (req, res) => {
+      const incomingSessionId = req.headers['mcp-session-id'] as string | undefined
+      if (incomingSessionId) terminatedSessionIds.push(incomingSessionId)
+      res.status(204).end()
+    })
+    mcp.on('POST', '/mcp', (req, res) => {
+      const body = req.body
+      const incomingSessionId = req.headers['mcp-session-id'] as string | undefined
+      if (body.method === 'initialize') {
+        if (incomingSessionId) {
+          return res.status(400).json({ jsonrpc: '2.0', id: body.id, error: { code: -32600, message: 'Server already initialized' } })
+        }
+        initializeCount += 1
+        const newSessionId = `session-${initializeCount}`
+        if (initializeCount === 1) probeSessionId = newSessionId
+        return res.header('Mcp-Session-Id', newSessionId).json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: {
+            protocolVersion: '2025-06-18',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'mock-stateful', version: '0.0.0' },
+          },
+        })
+      }
+      // Notifications and other non-initialize requests get accepted.
+      return res.status(202).end()
+    })
+
+    const authProvider = new NodeOAuthClientProvider(<OAuthProviderOptions>{
+      serverUrl: mcp.url('/mcp'),
+      serverUrlHash: 'proxy-session-leak-test',
+      callbackPort: 33419,
+      host: 'localhost',
+      callbackPath: '/oauth/callback',
+      staticOAuthClientInfo: {
+        client_id: 'noop-client-id',
+        redirect_uris: ['http://localhost:33419/oauth/callback'],
+        token_endpoint_auth_method: 'none',
+        grant_types: ['authorization_code'],
+        response_types: ['code'],
+      },
+    })
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
+
+    // Proxy path: client === null.
+    const transport = await connectToRemoteServer(null, mcp.url('/mcp'), authProvider, {}, authInitializer, 'http-only')
+
+    expect(initializeCount).toBe(1) // probe ran once on the throwaway transport
+    expect(probeSessionId).toBeDefined()
+    expect((transport as unknown as { _sessionId?: string })._sessionId).toBeUndefined()
+    // The throwaway transport's session was terminated on the server (DELETE) so it doesn't
+    // linger until the server's idle timeout.
+    expect(terminatedSessionIds).toEqual([probeSessionId])
+
+    // Simulate the proxy forwarding the local client's real initialize through the main transport.
+    // If the probe leaked its session id, the request would carry it and the server would 400.
+    transport.onmessage = vi.fn()
+    await transport.send({
+      jsonrpc: '2.0',
+      id: 99,
+      method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'real', version: '0.0.0' } },
+    })
+
+    expect(initializeCount).toBe(2) // a second initialize was accepted, not rejected
+    expect((transport as unknown as { _sessionId?: string })._sessionId).toBe('session-2')
+    expect((transport as unknown as { _sessionId?: string })._sessionId).not.toBe(probeSessionId)
+
+    await transport.close()
   }, 15_000)
 })
