@@ -14,6 +14,13 @@ import express from 'express'
 // All sanitizeUrl tests have been moved to the strict-url-sanitise package
 
 describe('Feature: Command Line Arguments Parsing', () => {
+  // parseCommandLineArgs mutates global.fetch when --socks-proxy or --enable-proxy is passed.
+  // Snapshot once and restore after every test so the alias can't leak into later tests.
+  const originalGlobalFetch = global.fetch
+  afterEach(() => {
+    global.fetch = originalGlobalFetch
+  })
+
   it('Scenario: Parse basic server URL', async () => {
     // Given command line arguments with only a server URL
     const args = ['https://example.com/sse']
