@@ -508,6 +508,42 @@ describe('Feature: Command Line Arguments Parsing', () => {
     }
   })
 
+  it('Scenario: --socks-proxy aliases global.fetch to npm undici fetch', async () => {
+    const undici = await import('undici')
+    const { getGlobalDispatcher, setGlobalDispatcher } = undici
+    const originalDispatcher = getGlobalDispatcher()
+    const originalFetch = global.fetch
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const args = ['https://example.com/sse', '--socks-proxy', 'socks5://127.0.0.1:1080']
+      await parseCommandLineArgs(args, 'test usage')
+
+      expect(global.fetch).toBe(undici.fetch)
+    } finally {
+      setGlobalDispatcher(originalDispatcher)
+      global.fetch = originalFetch
+      consoleSpy.mockRestore()
+    }
+  })
+
+  it('Scenario: --enable-proxy aliases global.fetch to npm undici fetch', async () => {
+    const undici = await import('undici')
+    const { getGlobalDispatcher, setGlobalDispatcher } = undici
+    const originalDispatcher = getGlobalDispatcher()
+    const originalFetch = global.fetch
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const args = ['https://example.com/sse', '--enable-proxy']
+      await parseCommandLineArgs(args, 'test usage')
+
+      expect(global.fetch).toBe(undici.fetch)
+    } finally {
+      setGlobalDispatcher(originalDispatcher)
+      global.fetch = originalFetch
+      consoleSpy.mockRestore()
+    }
+  })
+
   it('Scenario: Redact credentials in --socks-proxy log output', async () => {
     const { getGlobalDispatcher, setGlobalDispatcher } = await import('undici')
     const originalDispatcher = getGlobalDispatcher()
