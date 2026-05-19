@@ -531,7 +531,26 @@ export async function connectToRemoteServer(
         log('Completing authorization...')
         await transport.finishAuth(code)
         debugLog('Authorization completed successfully')
-        return transport
+
+        if (recursionReasons.has(REASON_AUTH_NEEDED)) {
+          const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
+          log(errorMessage)
+          debugLog('Already attempted auth reconnection, giving up', {
+            recursionReasons: Array.from(recursionReasons),
+          })
+          throw new Error(errorMessage)
+        }
+
+        // SSE transports throw UnauthorizedError from start() itself, before Client.connect's
+        // initialize try/catch can run `void this.close()`. Detach the failed transport so the
+        // recursive call's `client.connect(newTransport)` doesn't hit "Already connected".
+        // No-op on the HTTP path where the SDK already cleared `_transport`.
+        await client?.close()
+
+        recursionReasons.add(REASON_AUTH_NEEDED)
+        log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)
+        debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
+        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
       } catch (authError: any) {
         log('Authorization error:', authError)
         debugLog('Authorization error during finishAuth', {
