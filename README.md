@@ -1,8 +1,14 @@
-# `mcp-remote`
+# `@automattic/mcp-remote`
 
 Connect an MCP Client that only supports local (stdio) servers to a Remote MCP Server, with auth support:
 
 **Note: this is a working proof-of-concept** but should be considered **experimental**.
+
+## About this fork
+
+This package is published as [`@automattic/mcp-remote`](https://www.npmjs.com/package/@automattic/mcp-remote). It is a fork of [`anandnalya/mcp-remote`](https://github.com/anandnalya/mcp-remote), which is itself a fork of the original [`geelen/mcp-remote`](https://github.com/geelen/mcp-remote) by Glen Maddern.
+
+The upstream `geelen/mcp-remote` is no longer actively maintained, so this fork carries fixes and features that the original project has not picked up. Automattic maintains this fork to keep a published, supported build available under the `@automattic` scope for our own MCP integrations and anyone who depends on them. Install and run it with `npx @automattic/mcp-remote ...` (see [Usage](#usage) below).
 
 ## Why is this necessary?
 
@@ -24,7 +30,7 @@ All the most popular MCP clients (Claude Desktop, Cursor & Windsurf) use the fol
     "remote-example": {
       "command": "npx",
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse"
       ]
     }
@@ -42,7 +48,7 @@ To bypass authentication, or to emit custom headers on all requests to your remo
     "remote-example": {
       "command": "npx",
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse",
         "--header",
         "Authorization: Bearer ${AUTH_TOKEN}"
@@ -61,7 +67,7 @@ To bypass authentication, or to emit custom headers on all requests to your remo
 {
   // rest of config...
   "args": [
-    "mcp-remote",
+    "@automattic/mcp-remote",
     "https://remote.mcp.server/sse",
     "--header",
     "Authorization:${AUTH_HEADER}" // note no spaces around ':'
@@ -82,7 +88,7 @@ To run multiple instances of the same remote server with different configuration
     "atlassian_tenant1": {
       "command": "npx",
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://mcp.atlassian.com/v1/sse",
         "--resource",
         "https://tenant1.atlassian.net/"
@@ -91,7 +97,7 @@ To run multiple instances of the same remote server with different configuration
     "atlassian_tenant2": {
       "command": "npx",
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://mcp.atlassian.com/v1/sse",
         "--resource",
         "https://tenant2.atlassian.net/"
@@ -111,7 +117,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
       "command": "npx",
       "args": [
         "-y",
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse"
       ]
 ```
@@ -120,7 +126,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote@latest",
+        "@automattic/mcp-remote@latest",
         "https://remote.mcp.server/sse"
       ]
 ```
@@ -129,7 +135,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse",
         "9696"
       ]
@@ -139,7 +145,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse",
         "--host",
         "127.0.0.1"
@@ -150,7 +156,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "http://internal-service.vpc/sse",
         "--allow-http"
       ]
@@ -160,7 +166,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse",
         "--debug"
       ]
@@ -170,7 +176,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse",
         "--silent"
       ]
@@ -180,7 +186,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
     "args": [
-      "mcp-remote",
+      "@automattic/mcp-remote",
       "https://remote.mcp.server/sse",
       "--enable-proxy"
     ],
@@ -198,7 +204,7 @@ Each unique combination of server URL, resource, and custom headers will maintai
 
 ```json
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse",
         "--socks-proxy",
         "socks5://127.0.0.1:8080"
@@ -211,7 +217,7 @@ Note: `--socks-proxy` and `--enable-proxy` cannot be used together.
 
 ```json
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse",
         "--ignore-tool",
         "delete*",
@@ -229,7 +235,7 @@ You can specify multiple `--ignore-tool` flags to ignore different patterns. Exa
 
 ```json
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse",
         "--auth-timeout",
         "60"
@@ -243,7 +249,7 @@ MCP Remote supports different transport strategies when connecting to an MCP ser
 Specify the transport strategy with the `--transport` flag:
 
 ```bash
-npx mcp-remote https://example.remote/server --transport sse-only
+npx @automattic/mcp-remote https://example.remote/server --transport sse-only
 ```
 
 **Available Strategies:**
@@ -261,9 +267,9 @@ This is useful when connecting to OAuth servers that expect specific client/soft
 Provide the client metadata as a JSON string or as a `@` prefixed filepath with the `--static-oauth-client-metadata` flag:
 
 ```bash
-npx mcp-remote https://example.remote/server --static-oauth-client-metadata '{ "scope": "space separated scopes" }'
+npx @automattic/mcp-remote https://example.remote/server --static-oauth-client-metadata '{ "scope": "space separated scopes" }'
 # uses node readfile, so you probably want to use absolute paths if you're not sure what the cwd is
-npx mcp-remote https://example.remote/server --static-oauth-client-metadata '@/Users/username/Library/Application Support/Claude/oauth_client_metadata.json'
+npx @automattic/mcp-remote https://example.remote/server --static-oauth-client-metadata '@/Users/username/Library/Application Support/Claude/oauth_client_metadata.json'
 ```
 
 ### Static OAuth Client Information
@@ -279,9 +285,9 @@ Provide the client metadata as a JSON string or as a `@` prefixed filepath with 
 ```bash
 export MCP_REMOTE_CLIENT_ID=xxx
 export MCP_REMOTE_CLIENT_SECRET=yyy
-npx mcp-remote https://example.remote/server --static-oauth-client-info "{ \"client_id\": \"$MCP_REMOTE_CLIENT_ID\", \"client_secret\": \"$MCP_REMOTE_CLIENT_SECRET\" }"
+npx @automattic/mcp-remote https://example.remote/server --static-oauth-client-info "{ \"client_id\": \"$MCP_REMOTE_CLIENT_ID\", \"client_secret\": \"$MCP_REMOTE_CLIENT_SECRET\" }"
 # uses node readfile, so you probably want to use absolute paths if you're not sure what the cwd is
-npx mcp-remote https://example.remote/server --static-oauth-client-info '@/Users/username/Library/Application Support/Claude/oauth_client_info.json'
+npx @automattic/mcp-remote https://example.remote/server --static-oauth-client-info '@/Users/username/Library/Application Support/Claude/oauth_client_info.json'
 ```
 
 ### Claude Desktop
@@ -361,7 +367,7 @@ this might look like:
     "remote-example": {
       "command": "npx",
       "args": [
-        "mcp-remote",
+        "@automattic/mcp-remote",
         "https://remote.mcp.server/sse"
       ],
       "env": {
@@ -387,7 +393,7 @@ For troubleshooting complex issues, especially with token refreshing or authenti
 
 ```json
 "args": [
-  "mcp-remote",
+  "@automattic/mcp-remote",
   "https://remote.mcp.server/sse",
   "--debug"
 ]
@@ -411,7 +417,7 @@ You can run `rm -rf ~/.mcp-auth` to clear any locally stored state and tokens.
 Run the following on the command line (not from an MCP server):
 
 ```shell
-npx -p mcp-remote@latest mcp-remote-client https://remote.mcp.server/sse
+npx -p @automattic/mcp-remote@latest mcp-remote-client https://remote.mcp.server/sse
 ```
 
 This will run through the entire authorization flow and attempt to list the tools & resources at the remote URL. Try this after running `rm -rf ~/.mcp-auth` to see if stale credentials are your problem, otherwise hopefully the issue will be more obvious in these logs than those in your MCP client.
