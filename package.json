@@ -16,6 +16,9 @@
   ],
   "license": "MIT",
   "repository": "https://github.com/automattic/mcp-remote",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "files": [
     "dist",
