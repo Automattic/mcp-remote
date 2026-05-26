@@ -231,6 +231,19 @@ You can specify multiple `--ignore-tool` flags to ignore different patterns. Exa
 - `*account` - ignores all tools ending with "account" (e.g., `getAccount`, `updateAccount`)
 - `exactTool` - ignores only the tool named exactly "exactTool"
 
+* To inject server-level [MCP `InitializeResult.instructions`](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle) from a local file, add the `--instructions-file` flag. The file contents are appended to whatever the remote server already sends (or used as-is if the remote server sends none), so MCP clients such as Claude Code receive session-wide guidance without requiring an upstream server change.
+
+```json
+      "args": [
+        "@automattic/mcp-remote",
+        "https://remote.mcp.server/sse",
+        "--instructions-file",
+        "/path/to/server-instructions.md"
+      ]
+```
+
+The file is read once at startup. If it is missing or unreadable the proxy exits with an error; an empty file is logged and ignored.
+
 * To change the timeout for the OAuth callback (by default `30` seconds), add the `--auth-timeout` flag with a value in seconds. This is useful if the authentication process on the server side takes a long time.
 
 ```json

@@ -808,6 +808,175 @@ describe('Feature: MCP Proxy', () => {
     )
   })
 
+  it('Scenario: Append instructions to initialize response when configured', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      instructions: 'A8C: extra guidance for the client.',
+    })
+
+    // Client sends initialize so the proxy can correlate the response by id.
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: '42',
+        params: { clientInfo: { name: 'Test Client', version: '1.0.0' } },
+      } as any)
+    }
+
+    vi.clearAllMocks()
+
+    // Server replies with initialize result without instructions.
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0',
+        id: '42',
+        result: {
+          capabilities: { tools: {} },
+          serverInfo: { name: 'Upstream', version: '1.0.0' },
+        },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '42',
+        result: expect.objectContaining({
+          instructions: 'A8C: extra guidance for the client.',
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: Merge instructions with upstream-provided instructions', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      instructions: 'Local addendum.',
+    })
+
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: '7',
+        params: {},
+      } as any)
+    }
+    vi.clearAllMocks()
+
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0',
+        id: '7',
+        result: {
+          capabilities: {},
+          serverInfo: { name: 'Upstream', version: '1.0.0' },
+          instructions: 'Upstream guidance.',
+        },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '7',
+        result: expect.objectContaining({
+          instructions: 'Upstream guidance.\n\nLocal addendum.',
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: Do not touch initialize response when no instructions configured', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: '9',
+        params: {},
+      } as any)
+    }
+    vi.clearAllMocks()
+
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0',
+        id: '9',
+        result: { capabilities: {}, serverInfo: { name: 'Upstream', version: '1.0.0' } },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '9',
+        result: expect.not.objectContaining({ instructions: expect.anything() }),
+      }),
+    )
+  })
+
   it('Scenario: Close server transport when client transport closes', async () => {
     // Given mock transports for client and server
     const mockTransportToClient = {
