@@ -10,6 +10,9 @@ import {
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { EventEmitter } from 'events'
 import express from 'express'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
 
 // All sanitizeUrl tests have been moved to the strict-url-sanitise package
 
@@ -570,6 +573,95 @@ describe('Feature: Command Line Arguments Parsing', () => {
       setGlobalDispatcher(originalDispatcher)
       consoleSpy.mockRestore()
     }
+  })
+
+  describe('--instructions-file', () => {
+    let tmpDir: string
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-remote-instructions-'))
+    })
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('Scenario: Load instructions from a readable file', async () => {
+      const filePath = path.join(tmpDir, 'instructions.md')
+      fs.writeFileSync(filePath, '  hello from operator\n\n', 'utf8')
+
+      const result = await parseCommandLineArgs(['https://example.com/sse', '--instructions-file', filePath], 'test usage')
+
+      expect(result.instructions).toBe('hello from operator')
+    })
+
+    it('Scenario: Empty instructions file is ignored with a warning', async () => {
+      const filePath = path.join(tmpDir, 'empty.md')
+      fs.writeFileSync(filePath, '   \n\n', 'utf8')
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        const result = await parseCommandLineArgs(['https://example.com/sse', '--instructions-file', filePath], 'test usage')
+
+        expect(result.instructions).toBeNull()
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining(`Warning: --instructions-file ${filePath} is empty`))
+      } finally {
+        consoleSpy.mockRestore()
+      }
+    })
+
+    it('Scenario: Exit with error when --instructions-file points to an unreadable path', async () => {
+      const missingPath = path.join(tmpDir, 'does-not-exist.md')
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit')
+      })
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        await expect(
+          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage'),
+        ).rejects.toThrow('process.exit')
+        expect(exitSpy).toHaveBeenCalledWith(1)
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining(`could not be read`))
+      } finally {
+        exitSpy.mockRestore()
+        consoleSpy.mockRestore()
+      }
+    })
+
+    it('Scenario: Exit with error when --instructions-file has no value', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit')
+      })
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file'], 'test usage')).rejects.toThrow('process.exit')
+        expect(exitSpy).toHaveBeenCalledWith(1)
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('--instructions-file requires a path argument'))
+      } finally {
+        exitSpy.mockRestore()
+        consoleSpy.mockRestore()
+      }
+    })
+
+    it('Scenario: Exit with error when --instructions-file is followed by another flag', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit')
+      })
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        await expect(
+          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage'),
+        ).rejects.toThrow('process.exit')
+        expect(exitSpy).toHaveBeenCalledWith(1)
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('--instructions-file requires a path argument'))
+      } finally {
+        exitSpy.mockRestore()
+        consoleSpy.mockRestore()
+      }
+    })
   })
 })
 
