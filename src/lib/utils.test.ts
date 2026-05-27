@@ -10,6 +10,9 @@ import {
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { EventEmitter } from 'events'
 import express from 'express'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
 
 // All sanitizeUrl tests have been moved to the strict-url-sanitise package
 
@@ -571,6 +574,95 @@ describe('Feature: Command Line Arguments Parsing', () => {
       consoleSpy.mockRestore()
     }
   })
+
+  describe('--instructions-file', () => {
+    let tmpDir: string
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-remote-instructions-'))
+    })
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('Scenario: Load instructions from a readable file', async () => {
+      const filePath = path.join(tmpDir, 'instructions.md')
+      fs.writeFileSync(filePath, '  hello from operator\n\n', 'utf8')
+
+      const result = await parseCommandLineArgs(['https://example.com/sse', '--instructions-file', filePath], 'test usage')
+
+      expect(result.instructions).toBe('hello from operator')
+    })
+
+    it('Scenario: Empty instructions file is ignored with a warning', async () => {
+      const filePath = path.join(tmpDir, 'empty.md')
+      fs.writeFileSync(filePath, '   \n\n', 'utf8')
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        const result = await parseCommandLineArgs(['https://example.com/sse', '--instructions-file', filePath], 'test usage')
+
+        expect(result.instructions).toBeNull()
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining(`Warning: --instructions-file ${filePath} is empty`))
+      } finally {
+        consoleSpy.mockRestore()
+      }
+    })
+
+    it('Scenario: Exit with error when --instructions-file points to an unreadable path', async () => {
+      const missingPath = path.join(tmpDir, 'does-not-exist.md')
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit')
+      })
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        await expect(
+          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage'),
+        ).rejects.toThrow('process.exit')
+        expect(exitSpy).toHaveBeenCalledWith(1)
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining(`could not be read`))
+      } finally {
+        exitSpy.mockRestore()
+        consoleSpy.mockRestore()
+      }
+    })
+
+    it('Scenario: Exit with error when --instructions-file has no value', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit')
+      })
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file'], 'test usage')).rejects.toThrow('process.exit')
+        expect(exitSpy).toHaveBeenCalledWith(1)
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('--instructions-file requires a path argument'))
+      } finally {
+        exitSpy.mockRestore()
+        consoleSpy.mockRestore()
+      }
+    })
+
+    it('Scenario: Exit with error when --instructions-file is followed by another flag', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('process.exit')
+      })
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        await expect(
+          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage'),
+        ).rejects.toThrow('process.exit')
+        expect(exitSpy).toHaveBeenCalledWith(1)
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('--instructions-file requires a path argument'))
+      } finally {
+        exitSpy.mockRestore()
+        consoleSpy.mockRestore()
+      }
+    })
+  })
 })
 
 describe('Feature: Tool Filtering with Ignore Patterns', () => {
@@ -804,6 +896,291 @@ describe('Feature: MCP Proxy', () => {
             version: '1.0.0',
           },
         },
+      }),
+    )
+  })
+
+  it('Scenario: Append instructions to initialize response when configured', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      instructions: 'A8C: extra guidance for the client.',
+    })
+
+    // Client sends initialize so the proxy can correlate the response by id.
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: '42',
+        params: { clientInfo: { name: 'Test Client', version: '1.0.0' } },
+      } as any)
+    }
+
+    vi.clearAllMocks()
+
+    // Server replies with initialize result without instructions.
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0',
+        id: '42',
+        result: {
+          capabilities: { tools: {} },
+          serverInfo: { name: 'Upstream', version: '1.0.0' },
+        },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '42',
+        result: expect.objectContaining({
+          instructions: 'A8C: extra guidance for the client.',
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: Merge instructions with upstream-provided instructions', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      instructions: 'Local addendum.',
+    })
+
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: '7',
+        params: {},
+      } as any)
+    }
+    vi.clearAllMocks()
+
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0',
+        id: '7',
+        result: {
+          capabilities: {},
+          serverInfo: { name: 'Upstream', version: '1.0.0' },
+          instructions: 'Upstream guidance.',
+        },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '7',
+        result: expect.objectContaining({
+          instructions: 'Upstream guidance.\n\nLocal addendum.',
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: Do not touch initialize response when no instructions configured', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: '9',
+        params: {},
+      } as any)
+    }
+    vi.clearAllMocks()
+
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0',
+        id: '9',
+        result: { capabilities: {}, serverInfo: { name: 'Upstream', version: '1.0.0' } },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '9',
+        result: expect.not.objectContaining({ instructions: expect.anything() }),
+      }),
+    )
+  })
+
+  it('Scenario: Append instructions when initialize uses numeric id 0', async () => {
+    // Regression: SDK clients start request ids at 0; a falsy guard would skip correlation.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      instructions: 'A8C: extra guidance for the client.',
+    })
+
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: 0,
+        params: { clientInfo: { name: 'Test Client', version: '1.0.0' } },
+      } as any)
+    }
+
+    vi.clearAllMocks()
+
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0',
+        id: 0,
+        result: {
+          capabilities: { tools: {} },
+          serverInfo: { name: 'Upstream', version: '1.0.0' },
+        },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 0,
+        result: expect.objectContaining({
+          instructions: 'A8C: extra guidance for the client.',
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: Filter tools in tools/list response when id is numeric 0', async () => {
+    // Regression: same falsy-id guard previously dropped the transform for id 0.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: ['delete*'],
+    })
+
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0' as const,
+        method: 'tools/list',
+        id: 0,
+        params: {},
+      })
+    }
+    vi.clearAllMocks()
+
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0' as const,
+        id: 0,
+        result: {
+          tools: [
+            { name: 'createTask', description: 'Create' },
+            { name: 'deleteTask', description: 'Delete' },
+          ],
+        },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 0,
+        result: { tools: [{ name: 'createTask', description: 'Create' }] },
       }),
     )
   })

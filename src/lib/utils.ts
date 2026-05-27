@@ -111,14 +111,15 @@ export function createMessageTransformer({
 
   const interceptRequest = (message: Message) => {
     const messageId = message.id
-    if (!messageId) return message
+    // JSON-RPC allows id of 0 or ""; only notifications have no id field.
+    if (messageId === undefined || messageId === null) return message
     pendingRequests.set(messageId, message)
     return transformRequestFunction?.(message) ?? message
   }
 
   const interceptResponse = (message: Message) => {
     const messageId = message.id
-    if (!messageId) return message
+    if (messageId === undefined || messageId === null) return message
     const originalRequest = pendingRequests.get(messageId)
     if (!originalRequest) return message
     pendingRequests.delete(messageId)
@@ -139,10 +140,12 @@ export function mcpProxy({
   transportToClient,
   transportToServer,
   ignoredTools = [],
+  instructions = null,
 }: {
   transportToClient: Transport
   transportToServer: Transport
   ignoredTools?: string[]
+  instructions?: string | null
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
@@ -176,6 +179,21 @@ export function mcpProxy({
           result: {
             ...res.result,
             tools: res.result.tools.filter((tool: any) => shouldIncludeTool(ignoredTools, tool.name)),
+          },
+        }
+      }
+      // Append local instructions to the upstream initialize response so MCP clients
+      // (e.g. Claude Code) receive server-level guidance even when the remote server
+      // does not populate `instructions` itself. Spec: InitializeResult.instructions
+      // (https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle).
+      if (req.method === 'initialize' && instructions && res.result) {
+        const existing = typeof res.result.instructions === 'string' ? res.result.instructions.trim() : ''
+        const merged = existing ? `${existing}\n\n${instructions}` : instructions
+        return {
+          ...res,
+          result: {
+            ...res.result,
+            instructions: merged,
           },
         }
       }
@@ -921,6 +939,30 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     j++
   }
 
+  // Parse instructions file
+  let instructions: string | null = null
+  const instructionsFileIndex = args.indexOf('--instructions-file')
+  if (instructionsFileIndex !== -1) {
+    const rawPath = args[instructionsFileIndex + 1]
+    if (!rawPath || rawPath.startsWith('--')) {
+      log(`Error: --instructions-file requires a path argument`)
+      process.exit(1)
+    }
+    const instructionsPath = path.resolve(rawPath)
+    try {
+      const contents = (await readFile(instructionsPath, 'utf8')).trim()
+      if (contents.length > 0) {
+        instructions = contents
+        log(`Loaded MCP server instructions from: ${instructionsPath} (${contents.length} chars)`)
+      } else {
+        log(`Warning: --instructions-file ${instructionsPath} is empty; ignoring.`)
+      }
+    } catch (err) {
+      log(`Error: --instructions-file ${instructionsPath} could not be read: ${err instanceof Error ? err.message : String(err)}`)
+      process.exit(1)
+    }
+  }
+
   // Parse auth timeout
   let authTimeoutMs = 30000 // Default 30 seconds
   const authTimeoutIndex = args.indexOf('--auth-timeout')
@@ -1008,6 +1050,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     staticOAuthClientInfo,
     authorizeResource,
     ignoredTools,
+    instructions,
     authTimeoutMs,
     serverUrlHash,
   }

@@ -38,6 +38,7 @@ async function runProxy(
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
   authorizeResource: string,
   ignoredTools: string[],
+  instructions: string | null,
   authTimeoutMs: number,
   serverUrlHash: string,
 ) {
@@ -114,6 +115,7 @@ async function runProxy(
       transportToClient: localTransport,
       transportToServer: remoteTransport,
       ignoredTools,
+      instructions,
     })
 
     // Start the local STDIO server
@@ -178,6 +180,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       staticOAuthClientInfo,
       authorizeResource,
       ignoredTools,
+      instructions,
       authTimeoutMs,
       serverUrlHash,
     }) => {
@@ -191,6 +194,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         staticOAuthClientInfo,
         authorizeResource,
         ignoredTools,
+        instructions,
         authTimeoutMs,
         serverUrlHash,
       )
