@@ -111,14 +111,15 @@ export function createMessageTransformer({
 
   const interceptRequest = (message: Message) => {
     const messageId = message.id
-    if (!messageId) return message
+    // JSON-RPC allows id of 0 or ""; only notifications have no id field.
+    if (messageId === undefined || messageId === null) return message
     pendingRequests.set(messageId, message)
     return transformRequestFunction?.(message) ?? message
   }
 
   const interceptResponse = (message: Message) => {
     const messageId = message.id
-    if (!messageId) return message
+    if (messageId === undefined || messageId === null) return message
     const originalRequest = pendingRequests.get(messageId)
     if (!originalRequest) return message
     pendingRequests.delete(messageId)
@@ -941,8 +942,13 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   // Parse instructions file
   let instructions: string | null = null
   const instructionsFileIndex = args.indexOf('--instructions-file')
-  if (instructionsFileIndex !== -1 && instructionsFileIndex < args.length - 1) {
-    const instructionsPath = args[instructionsFileIndex + 1]
+  if (instructionsFileIndex !== -1) {
+    const rawPath = args[instructionsFileIndex + 1]
+    if (!rawPath || rawPath.startsWith('--')) {
+      log(`Error: --instructions-file requires a path argument`)
+      process.exit(1)
+    }
+    const instructionsPath = path.resolve(rawPath)
     try {
       const contents = (await readFile(instructionsPath, 'utf8')).trim()
       if (contents.length > 0) {

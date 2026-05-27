@@ -977,6 +977,122 @@ describe('Feature: MCP Proxy', () => {
     )
   })
 
+  it('Scenario: Append instructions when initialize uses numeric id 0', async () => {
+    // Regression: SDK clients start request ids at 0; a falsy guard would skip correlation.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      instructions: 'A8C: extra guidance for the client.',
+    })
+
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: 0,
+        params: { clientInfo: { name: 'Test Client', version: '1.0.0' } },
+      } as any)
+    }
+
+    vi.clearAllMocks()
+
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0',
+        id: 0,
+        result: {
+          capabilities: { tools: {} },
+          serverInfo: { name: 'Upstream', version: '1.0.0' },
+        },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 0,
+        result: expect.objectContaining({
+          instructions: 'A8C: extra guidance for the client.',
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: Filter tools in tools/list response when id is numeric 0', async () => {
+    // Regression: same falsy-id guard previously dropped the transform for id 0.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: ['delete*'],
+    })
+
+    if (mockTransportToClient.onmessage) {
+      mockTransportToClient.onmessage({
+        jsonrpc: '2.0' as const,
+        method: 'tools/list',
+        id: 0,
+        params: {},
+      })
+    }
+    vi.clearAllMocks()
+
+    if (mockTransportToServer.onmessage) {
+      mockTransportToServer.onmessage({
+        jsonrpc: '2.0' as const,
+        id: 0,
+        result: {
+          tools: [
+            { name: 'createTask', description: 'Create' },
+            { name: 'deleteTask', description: 'Delete' },
+          ],
+        },
+      } as any)
+    }
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 0,
+        result: { tools: [{ name: 'createTask', description: 'Create' }] },
+      }),
+    )
+  })
+
   it('Scenario: Close server transport when client transport closes', async () => {
     // Given mock transports for client and server
     const mockTransportToClient = {

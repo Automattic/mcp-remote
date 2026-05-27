@@ -242,7 +242,7 @@ You can specify multiple `--ignore-tool` flags to ignore different patterns. Exa
       ]
 ```
 
-The file is read once at startup. If it is missing or unreadable the proxy exits with an error; an empty file is logged and ignored.
+The file is read once at startup. Relative paths are resolved against the proxy's working directory (which may not match your shell's cwd when launched by a client like Claude Desktop), so prefer absolute paths. If the path is missing or unreadable the proxy exits with an error; an empty file is logged and ignored.
 
 * To change the timeout for the OAuth callback (by default `30` seconds), add the `--auth-timeout` flag with a value in seconds. This is useful if the authentication process on the server side takes a long time.
 
