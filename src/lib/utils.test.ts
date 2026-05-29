@@ -618,9 +618,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       try {
-        await expect(
-          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage'),
-        ).rejects.toThrow('process.exit')
+        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage')).rejects.toThrow(
+          'process.exit',
+        )
         expect(exitSpy).toHaveBeenCalledWith(1)
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining(`could not be read`))
       } finally {
@@ -652,9 +652,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       try {
-        await expect(
-          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage'),
-        ).rejects.toThrow('process.exit')
+        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage')).rejects.toThrow(
+          'process.exit',
+        )
         expect(exitSpy).toHaveBeenCalledWith(1)
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('--instructions-file requires a path argument'))
       } finally {
@@ -795,6 +795,10 @@ describe('Feature: MCP Proxy', () => {
       mockTransportToClient.onmessage(initializeMessage)
     }
 
+    // Client→server forwarding is serialized through a promise chain, so flush
+    // pending microtasks before asserting the send happened.
+    await new Promise((resolve) => setImmediate(resolve))
+
     // Then the message should be forwarded to the server
     expect(mockTransportToServer.send).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -854,6 +858,9 @@ describe('Feature: MCP Proxy', () => {
     if (mockTransportToClient.onmessage) {
       mockTransportToClient.onmessage(clientRequest)
     }
+
+    // Flush the serialized client→server forwarding before clearing mocks.
+    await new Promise((resolve) => setImmediate(resolve))
 
     // Clear the previous call
     vi.clearAllMocks()
@@ -1495,6 +1502,156 @@ describe('Feature: MCP Proxy', () => {
         result: {},
       }),
     )
+  })
+
+  it('Scenario: Serialize client→server sends so a request cannot race ahead of initialize', async () => {
+    // Regression: with fire-and-forget forwarding, a request POSTed before the
+    // initialize response resolves goes out before a session id is known. For
+    // session-based transports (Streamable HTTP) the server then rejects it with
+    // "Missing Mcp-Session-Id". Forwarding must be serialized.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    // The first send() (initialize) blocks until we release it; later sends must wait.
+    let releaseInitialize: () => void = () => {}
+    const initializeSent = new Promise<void>((resolve) => {
+      releaseInitialize = resolve
+    })
+    const serverSend = vi
+      .fn()
+      .mockImplementationOnce(() => initializeSent)
+      .mockResolvedValue(undefined)
+    const mockTransportToServer = {
+      send: serverSend,
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    // Client pipelines initialize and a tools/call back-to-back.
+    mockTransportToClient.onmessage!({
+      jsonrpc: '2.0',
+      method: 'initialize',
+      id: '1',
+      params: { clientInfo: { name: 'Test Client', version: '1.0.0' } },
+    } as any)
+    mockTransportToClient.onmessage!({
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      id: '2',
+      params: { name: 'someTool', arguments: {} },
+    } as any)
+
+    await new Promise((resolve) => setImmediate(resolve))
+
+    // Only initialize has been forwarded; the tools/call is still queued behind it.
+    expect(serverSend).toHaveBeenCalledTimes(1)
+    expect(serverSend).toHaveBeenNthCalledWith(1, expect.objectContaining({ method: 'initialize', id: '1' }))
+
+    // Once initialize resolves (session established), the tools/call is forwarded.
+    releaseInitialize()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(serverSend).toHaveBeenCalledTimes(2)
+    expect(serverSend).toHaveBeenNthCalledWith(2, expect.objectContaining({ method: 'tools/call', id: '2' }))
+  })
+
+  it('Scenario: Surface a JSON-RPC error to the client when forwarding a request fails', async () => {
+    // Regression: a failed request forward used to be logged and swallowed,
+    // leaving the client waiting forever. It must receive a JSON-RPC error.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(new Error('Missing Mcp-Session-Id')),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    mockTransportToClient.onmessage!({
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      id: '5',
+      params: { name: 'someTool', arguments: {} },
+    } as any)
+
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jsonrpc: '2.0',
+        id: '5',
+        error: expect.objectContaining({
+          code: -32603,
+          message: expect.stringContaining('Missing Mcp-Session-Id'),
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: Do not send an error response when a forwarded notification fails', async () => {
+    // Notifications have no id, so there is nothing to respond to — just log.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(new Error('boom')),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    mockTransportToClient.onmessage!({
+      jsonrpc: '2.0',
+      method: 'notifications/initialized',
+    } as any)
+
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(mockTransportToClient.send).not.toHaveBeenCalled()
   })
 })
 
