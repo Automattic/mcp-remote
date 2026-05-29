@@ -201,6 +201,17 @@ export function mcpProxy({
     },
   })
 
+  // Serialize client→server forwarding. Each message is sent only after the
+  // previous send() has fully resolved. This preserves the order the client
+  // sent messages in and, critically, prevents requests from racing ahead of
+  // `initialize`: for session-based transports (Streamable HTTP) the session id
+  // is only learned from the initialize response, so a request POSTed before
+  // that response resolves would go out with no `Mcp-Session-Id` and be rejected
+  // by the server. Without serialization this happens whenever the client's
+  // messages are buffered (e.g. while mcp-remote is still running its startup
+  // transport probe) and then flushed back-to-back.
+  let clientToServerChain: Promise<void> = Promise.resolve()
+
   transportToClient.onmessage = (_message) => {
     // TODO: fix types
     const message = messageTransformer.interceptRequest(_message as any)
@@ -226,7 +237,9 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
-    transportToServer.send(message).catch(onServerError)
+    clientToServerChain = clientToServerChain
+      .then(() => transportToServer.send(message))
+      .catch((error: Error) => onServerRequestError(error, message))
   }
 
   transportToServer.onmessage = (_message) => {
@@ -274,6 +287,27 @@ export function mcpProxy({
   function onServerError(error: Error) {
     log('Error from remote server:', error)
     debugLog('Error from remote server', { stack: error.stack })
+  }
+
+  // When forwarding a client *request* to the server fails, the client is left
+  // waiting forever for a response. Surface the failure as a JSON-RPC error so
+  // the client can react (and retry) instead of hanging. Notifications (no id)
+  // have nothing to respond to, so we only log those.
+  function onServerRequestError(error: Error, message: any) {
+    onServerError(error)
+    const id = message && !Array.isArray(message) ? message.id : undefined
+    if (id !== undefined && id !== null) {
+      transportToClient
+        .send({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32603,
+            message: `Proxy failed to forward request to remote server: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        })
+        .catch(onClientError)
+    }
   }
 }
 
