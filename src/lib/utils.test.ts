@@ -620,9 +620,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       try {
-        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage')).rejects.toThrow(
-          'process.exit',
-        )
+        await expect(
+          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage'),
+        ).rejects.toThrow('process.exit')
         expect(exitSpy).toHaveBeenCalledWith(1)
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining(`could not be read`))
       } finally {
@@ -654,9 +654,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       try {
-        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage')).rejects.toThrow(
-          'process.exit',
-        )
+        await expect(
+          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage'),
+        ).rejects.toThrow('process.exit')
         expect(exitSpy).toHaveBeenCalledWith(1)
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('--instructions-file requires a path argument'))
       } finally {
