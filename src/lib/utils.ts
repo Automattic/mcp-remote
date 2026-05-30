@@ -226,7 +226,7 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
-    transportToServer.send(message).catch(onServerError)
+    transportToServer.send(message).catch((error: Error) => onServerRequestError(error, message))
   }
 
   transportToServer.onmessage = (_message) => {
@@ -274,6 +274,51 @@ export function mcpProxy({
   function onServerError(error: Error) {
     log('Error from remote server:', error)
     debugLog('Error from remote server', { stack: error.stack })
+  }
+
+  // When there is a problem forwarding client request to remote server,
+  // inform the client.
+  function onServerRequestError(error: Error, message: any) {
+    onServerError(error)
+
+    const id = message && !Array.isArray(message) ? message.id : undefined
+    if (id === undefined || id === null) {
+      // This is a notification, not a request response. Nothing to reply to.
+      return
+    }
+
+    let code = -32603 // JSON-RPC "Internal error"
+    let responseMessage = `Proxy failed to forward request to remote server: ${error instanceof Error ? error.message : String(error)}`
+    const data: Record<string, unknown> = {
+      errorType: error?.constructor?.name,
+    }
+
+    if (error instanceof StreamableHTTPError) {
+      data.httpStatus = error.code
+
+      const marker = 'Error POSTing to endpoint: '
+      const markerIndex = error.message.indexOf(marker)
+      if (markerIndex !== -1) {
+        const body = error.message.slice(markerIndex + marker.length)
+        try {
+          const inner = JSON.parse(body)
+          // A valid JSON-RPC error envelope has an `error` object with a code.
+          if (inner && inner.error && typeof inner.error.code === 'number') {
+            transportToClient.send({ jsonrpc: '2.0', id, error: inner.error }).catch(onClientError)
+            return
+          }
+        } catch {
+          // Body wasn't JSON-RPC error. Fall through to generic handler.
+        }
+      }
+
+      responseMessage = `Remote server returned HTTP ${error.code}: ${error.message}`
+    } else if (error instanceof UnauthorizedError) {
+      data.authRequired = true
+      responseMessage = `Authentication error: ${error.message}`
+    }
+
+    transportToClient.send({ jsonrpc: '2.0', id, error: { code, message: responseMessage, data } }).catch(onClientError)
   }
 }
 
