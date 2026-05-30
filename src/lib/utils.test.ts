@@ -8,6 +8,8 @@ import {
   redactSensitiveHeaders,
 } from './utils'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import { EventEmitter } from 'events'
 import express from 'express'
 import fs from 'fs'
@@ -1653,5 +1655,119 @@ describe('Feature: Redact Sensitive Headers', () => {
     const redacted = redactSensitiveHeaders(input)
     expect(input).toEqual({ Authorization: 'Basic abc' })
     expect(redacted).not.toBe(input)
+  })
+})
+
+describe('Feature: Surface failed client→server forwards', () => {
+  // Helpers to build fresh mock transports for each scenario.
+  function makeTransport(): Transport {
+    return {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+  }
+
+  // Let the `send(...).catch(onServerRequestError)` promise chain settle so the
+  // synthetic error response reaches transportToClient before we assert.
+  function flushMicrotasks(): Promise<void> {
+    return new Promise((resolve) => setImmediate(resolve))
+  }
+
+  // Wires up the proxy with a server transport whose send() rejects with `error`,
+  // then simulates the client sending `clientMessage`. Returns the client transport
+  // so the caller can inspect what (if anything) was sent back.
+  async function forwardFailureWith(error: Error, clientMessage: any) {
+    const transportToClient = makeTransport()
+    const transportToServer = makeTransport()
+    transportToServer.send = vi.fn().mockRejectedValue(error)
+
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [] })
+
+    transportToClient.onmessage?.(clientMessage)
+    await flushMicrotasks()
+
+    return transportToClient
+  }
+
+  // A plain request (has an id, not `initialize`, not a tools/call) that the proxy
+  // will simply forward to the server.
+  const pingRequest = { jsonrpc: '2.0' as const, method: 'ping', id: '7' }
+
+  it('Scenario: UnauthorizedError is surfaced as an authentication error', async () => {
+    // Given forwarding fails with an auth error carrying the SDK's reason
+    const transportToClient = await forwardFailureWith(new UnauthorizedError('Unauthorized'), pingRequest)
+
+    // Then the client receives a JSON-RPC error that names the auth category and
+    // passes the SDK's own message through verbatim (no invented cause/remedy).
+    expect(transportToClient.send).toHaveBeenCalledTimes(1)
+    expect(transportToClient.send).toHaveBeenCalledWith({
+      jsonrpc: '2.0',
+      id: '7',
+      error: {
+        code: -32603,
+        message: 'Authentication error: Unauthorized',
+        data: { errorType: 'UnauthorizedError', authRequired: true },
+      },
+    })
+  })
+
+  it("Scenario: StreamableHTTPError forwards the server's own JSON-RPC error verbatim", async () => {
+    // Given the server returned a well-formed JSON-RPC error embedded in the body
+    // of a non-2xx response (the SDK puts that body after this marker).
+    const innerError = { code: -32004, message: 'Resource not found', data: { detail: 'gone' } }
+    const body = JSON.stringify({ jsonrpc: '2.0', id: '7', error: innerError })
+    const error = new StreamableHTTPError(404, `Error POSTing to endpoint: ${body}`)
+
+    const transportToClient = await forwardFailureWith(error, pingRequest)
+
+    // Then the proxy unwraps and forwards the inner error untouched, rather than
+    // masking it behind a generic -32603.
+    expect(transportToClient.send).toHaveBeenCalledTimes(1)
+    expect(transportToClient.send).toHaveBeenCalledWith({
+      jsonrpc: '2.0',
+      id: '7',
+      error: innerError,
+    })
+  })
+
+  it('Scenario: StreamableHTTPError without a parseable body reports the HTTP status', async () => {
+    // Given a non-2xx response whose body is not a JSON-RPC error envelope
+    const error = new StreamableHTTPError(503, 'Error POSTing to endpoint: upstream unavailable')
+
+    const transportToClient = await forwardFailureWith(error, pingRequest)
+
+    // Then the client gets a structured error carrying the HTTP status
+    expect(transportToClient.send).toHaveBeenCalledTimes(1)
+    const sent = (transportToClient.send as any).mock.calls[0][0]
+    expect(sent.id).toBe('7')
+    expect(sent.error.code).toBe(-32603)
+    expect(sent.error.message).toContain('Remote server returned HTTP 503')
+    expect(sent.error.data).toMatchObject({ errorType: 'StreamableHTTPError', httpStatus: 503 })
+  })
+
+  it('Scenario: a generic forwarding error falls back to a proxy error', async () => {
+    // Given forwarding fails with an ordinary error (e.g. a transport/network fault)
+    const transportToClient = await forwardFailureWith(new Error('socket hang up'), pingRequest)
+
+    // Then the client gets the generic proxy-failure error with the error type
+    expect(transportToClient.send).toHaveBeenCalledTimes(1)
+    const sent = (transportToClient.send as any).mock.calls[0][0]
+    expect(sent.id).toBe('7')
+    expect(sent.error.code).toBe(-32603)
+    expect(sent.error.message).toBe('Proxy failed to forward request to remote server: socket hang up')
+    expect(sent.error.data).toEqual({ errorType: 'Error' })
+  })
+
+  it('Scenario: a failed notification (no id) produces no response', async () => {
+    // Given a notification (no id) whose forwarding fails
+    const notification = { jsonrpc: '2.0' as const, method: 'notifications/cancelled' }
+    const transportToClient = await forwardFailureWith(new UnauthorizedError('Unauthorized'), notification)
+
+    // Then nothing is sent back — there is no request id to respond to.
+    expect(transportToClient.send).not.toHaveBeenCalled()
   })
 })
