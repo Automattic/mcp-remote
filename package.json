@@ -39,11 +39,11 @@
     "test:unit:watch": "vitest"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "open": "^10.1.0",
-    "socks": "^2.8.7",
+    "express": "^4.22.2",
+    "open": "^10.2.0",
+    "socks": "^2.8.9",
     "strict-url-sanitise": "^0.0.1",
-    "undici": "^7.24.0"
+    "undici": "^7.29.0"
   },
   "pnpm": {
     "overrides": {
@@ -52,15 +52,15 @@
     }
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@types/express": "^5.0.6",
-    "@types/node": "^22.19.17",
-    "prettier": "^3.8.3",
+    "@types/node": "^22.20.1",
+    "prettier": "^3.9.6",
     "tsup": "^8.5.1",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.12",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4",
-    "zod": "^4.3.6"
+    "vitest": "^3.2.7",
+    "zod": "^4.4.3"
   },
   "tsup": {
     "entry": [
