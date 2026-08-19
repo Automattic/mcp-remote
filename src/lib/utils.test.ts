@@ -518,38 +518,60 @@ describe('Feature: Command Line Arguments Parsing', () => {
     }
   })
 
-  it('Scenario: --socks-proxy aliases global.fetch to npm undici fetch', async () => {
+  it('Scenario: --socks-proxy aliases global fetch and companion classes to npm undici', async () => {
     const undici = await import('undici')
     const { getGlobalDispatcher, setGlobalDispatcher } = undici
     const originalDispatcher = getGlobalDispatcher()
     const originalFetch = global.fetch
+    const originalHeaders = global.Headers
+    const originalRequest = global.Request
+    const originalResponse = global.Response
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const args = ['https://example.com/sse', '--socks-proxy', 'socks5://127.0.0.1:1080']
       await parseCommandLineArgs(args, 'test usage')
 
       expect(global.fetch).toBe(undici.fetch)
+      // Headers/Request/Response must move together with fetch: the SDK's OAuth error
+      // handling does `response instanceof Response` against the global Response, and a
+      // response from npm undici's fetch fails that check against Node's built-in class.
+      expect(global.Headers).toBe(undici.Headers)
+      expect(global.Request).toBe(undici.Request)
+      expect(global.Response).toBe(undici.Response)
+      expect(new undici.Response('{}') instanceof global.Response).toBe(true)
     } finally {
       setGlobalDispatcher(originalDispatcher)
       global.fetch = originalFetch
+      global.Headers = originalHeaders
+      global.Request = originalRequest
+      global.Response = originalResponse
       consoleSpy.mockRestore()
     }
   })
 
-  it('Scenario: --enable-proxy aliases global.fetch to npm undici fetch', async () => {
+  it('Scenario: --enable-proxy aliases global fetch and companion classes to npm undici', async () => {
     const undici = await import('undici')
     const { getGlobalDispatcher, setGlobalDispatcher } = undici
     const originalDispatcher = getGlobalDispatcher()
     const originalFetch = global.fetch
+    const originalHeaders = global.Headers
+    const originalRequest = global.Request
+    const originalResponse = global.Response
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const args = ['https://example.com/sse', '--enable-proxy']
       await parseCommandLineArgs(args, 'test usage')
 
       expect(global.fetch).toBe(undici.fetch)
+      expect(global.Headers).toBe(undici.Headers)
+      expect(global.Request).toBe(undici.Request)
+      expect(global.Response).toBe(undici.Response)
     } finally {
       setGlobalDispatcher(originalDispatcher)
       global.fetch = originalFetch
+      global.Headers = originalHeaders
+      global.Request = originalRequest
+      global.Response = originalResponse
       consoleSpy.mockRestore()
     }
   })
@@ -618,9 +640,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       try {
-        await expect(
-          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage'),
-        ).rejects.toThrow('process.exit')
+        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage')).rejects.toThrow(
+          'process.exit',
+        )
         expect(exitSpy).toHaveBeenCalledWith(1)
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining(`could not be read`))
       } finally {
@@ -652,9 +674,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       try {
-        await expect(
-          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage'),
-        ).rejects.toThrow('process.exit')
+        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage')).rejects.toThrow(
+          'process.exit',
+        )
         expect(exitSpy).toHaveBeenCalledWith(1)
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('--instructions-file requires a path argument'))
       } finally {

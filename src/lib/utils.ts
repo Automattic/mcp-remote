@@ -21,7 +21,7 @@ import fs from 'fs'
 import { readFile, rm } from 'fs/promises'
 import path from 'path'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
-import { EnvHttpProxyAgent, fetch, Headers, RequestInit, setGlobalDispatcher } from 'undici'
+import { EnvHttpProxyAgent, fetch, Headers, Request, RequestInit, Response, setGlobalDispatcher } from 'undici'
 import { createSocksDispatcher, redactProxyUrl } from './socks-dispatcher'
 
 // Global type declaration for typescript
@@ -786,6 +786,26 @@ export async function findAvailablePort(preferredPort?: number): Promise<number>
  * @param usage Usage message to show on error
  * @returns A promise that resolves to an object with parsed serverUrl, callbackPort and headers
  */
+/**
+ * Routes global fetch through npm undici so a dispatcher set via setGlobalDispatcher
+ * (npm undici) is guaranteed to apply to SDK transports calling global.fetch, even on
+ * Node versions whose built-in fetch uses a separate undici instance.
+ *
+ * The companion classes must be aliased together with fetch: the SDK's OAuth error
+ * handling checks `response instanceof Response` against the global Response, and a
+ * response produced by npm undici's fetch fails that check against Node's built-in
+ * Response class. That mismatch turned every OAuth error response (e.g. invalid_grant
+ * during refresh-token rotation) into an unparseable ServerError ("Raw body: [object
+ * Response]"), which the SDK's auth flow silently swallows before falling back to a
+ * full browser re-authorization.
+ */
+function installUndiciGlobals() {
+  global.fetch = fetch as unknown as typeof global.fetch
+  global.Headers = Headers as unknown as typeof global.Headers
+  global.Request = Request as unknown as typeof global.Request
+  global.Response = Response as unknown as typeof global.Response
+}
+
 export async function parseCommandLineArgs(args: string[], usage: string) {
   // Process headers
   const headers: Record<string, string> = {}
@@ -844,9 +864,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   if (enableProxy) {
     // Use env proxy
     setGlobalDispatcher(new EnvHttpProxyAgent())
-    // On Node 22+, global.fetch uses Node's built-in undici, a separate instance from npm undici.
-    // Alias it so setGlobalDispatcher (npm undici) applies to SDK transports calling global.fetch.
-    global.fetch = fetch as unknown as typeof global.fetch
+    installUndiciGlobals()
     log('HTTP proxy support enabled - using system HTTP_PROXY/HTTPS_PROXY environment variables')
   }
 
@@ -855,9 +873,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     try {
       const dispatcher = createSocksDispatcher(socksUrl)
       setGlobalDispatcher(dispatcher)
-      // On Node 22+, global.fetch uses Node's built-in undici, a separate instance from npm undici.
-      // Alias it so setGlobalDispatcher (npm undici) applies to SDK transports calling global.fetch.
-      global.fetch = fetch as unknown as typeof global.fetch
+      installUndiciGlobals()
       log(`SOCKS proxy enabled: ${redactProxyUrl(socksUrl)}`)
     } catch (err) {
       log(`Error: Invalid --socks-proxy URL: ${err instanceof Error ? err.message : String(err)}`)

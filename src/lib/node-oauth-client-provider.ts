@@ -31,6 +31,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private authorizeResource: string | undefined
   private _state: string
   private _clientInfo: OAuthClientInformationFull | undefined
+  private _lastReadRefreshToken: string | undefined
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
@@ -194,6 +195,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Token request stack trace:', new Error().stack)
 
     const tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    this._lastReadRefreshToken = tokens?.refresh_token
 
     if (tokens) {
       const timeLeft = tokens.expires_in || 0
@@ -246,6 +248,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     })
 
     await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+    this._lastReadRefreshToken = tokens.refresh_token
   }
 
   /**
@@ -323,10 +326,20 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         debugLog('Client information invalidated')
         break
 
-      case 'tokens':
+      case 'tokens': {
+        if (await this.tokensWereRotatedByAnotherProcess()) {
+          // Refresh tokens are single use on rotating servers: when several mcp-remote
+          // processes share this token file, the first to refresh wins and the others
+          // fail with invalid_grant while holding the stale token. The winner's fresh
+          // tokens are already on disk, so keep them - the SDK re-runs the auth flow
+          // after this call and picks them up, instead of forcing a browser re-auth.
+          log('Stored tokens were rotated by a concurrent process - keeping the newer tokens and retrying with them')
+          break
+        }
         await deleteConfigFile(this.serverUrlHash, 'tokens.json')
         debugLog('OAuth tokens invalidated')
         break
+      }
 
       case 'verifier':
         await deleteConfigFile(this.serverUrlHash, 'code_verifier.txt')
@@ -336,5 +349,18 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       default:
         throw new Error(`Unknown credential scope: ${scope}`)
     }
+  }
+
+  /**
+   * Checks whether the tokens on disk carry a different refresh token than the one
+   * this process last read or saved. If so, a concurrent process rotated the tokens
+   * after we loaded ours, and the on-disk pair is the live one.
+   */
+  private async tokensWereRotatedByAnotherProcess(): Promise<boolean> {
+    if (!this._lastReadRefreshToken) {
+      return false
+    }
+    const onDisk = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    return !!onDisk?.refresh_token && onDisk.refresh_token !== this._lastReadRefreshToken
   }
 }
