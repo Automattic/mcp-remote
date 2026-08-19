@@ -781,12 +781,6 @@ export async function findAvailablePort(preferredPort?: number): Promise<number>
 }
 
 /**
- * Parses command line arguments for MCP clients and proxies
- * @param args Command line arguments
- * @param usage Usage message to show on error
- * @returns A promise that resolves to an object with parsed serverUrl, callbackPort and headers
- */
-/**
  * Routes global fetch through npm undici so a dispatcher set via setGlobalDispatcher
  * (npm undici) is guaranteed to apply to SDK transports calling global.fetch, even on
  * Node versions whose built-in fetch uses a separate undici instance.
@@ -806,6 +800,12 @@ function installUndiciGlobals() {
   global.Response = Response as unknown as typeof global.Response
 }
 
+/**
+ * Parses command line arguments for MCP clients and proxies
+ * @param args Command line arguments
+ * @param usage Usage message to show on error
+ * @returns A promise that resolves to an object with parsed serverUrl, callbackPort and headers
+ */
 export async function parseCommandLineArgs(args: string[], usage: string) {
   // Process headers
   const headers: Record<string, string> = {}

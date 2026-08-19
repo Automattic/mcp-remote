@@ -159,6 +159,71 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
       expect(mockDeleteConfigFile).not.toHaveBeenCalledWith('test-hash', 'client_info.json')
     })
+
+    describe('rotation guard', () => {
+      const tokensWith = (refreshToken: string) => ({
+        access_token: `access-for-${refreshToken}`,
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: refreshToken,
+      })
+
+      beforeEach(() => {
+        provider = new NodeOAuthClientProvider(defaultOptions)
+      })
+
+      it('deletes tokens when the on-disk refresh token matches the one this process last read', async () => {
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+        await provider.tokens()
+
+        await provider.invalidateCredentials('tokens')
+
+        expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      })
+
+      it('keeps tokens when a concurrent process rotated them after this process read its copy', async () => {
+        // This process loaded refresh-1, refreshed with it, and got invalid_grant because a
+        // concurrent process already rotated it. The winner's refresh-2 is on disk.
+        mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
+        await provider.tokens()
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+
+        await provider.invalidateCredentials('tokens')
+
+        expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      })
+
+      it('deletes tokens when this process never read any tokens', async () => {
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+
+        await provider.invalidateCredentials('tokens')
+
+        expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      })
+
+      it('deletes tokens when the token file is gone', async () => {
+        mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
+        await provider.tokens()
+        mockReadJsonFile.mockResolvedValue(undefined)
+
+        await provider.invalidateCredentials('tokens')
+
+        expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      })
+
+      it('treats tokens this process saved itself as its own when guarding invalidation', async () => {
+        mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
+        await provider.tokens()
+        // This process wins the refresh race and saves the rotated pair.
+        await provider.saveTokens(tokensWith('refresh-2') as any)
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+
+        await provider.invalidateCredentials('tokens')
+
+        // Disk matches what we saved, so a later invalid_grant means our grant is dead.
+        expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      })
+    })
   })
 
   describe('scopes_supported parsing', () => {
@@ -301,94 +366,5 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       // Empty scope should fallback to default
       expect(clientMetadata.scope).toBe('openid email profile')
     })
-  })
-})
-
-describe('NodeOAuthClientProvider - Token Invalidation Guard', () => {
-  let provider: NodeOAuthClientProvider
-  let mockReadJsonFile: any
-  let mockWriteJsonFile: any
-  let mockDeleteConfigFile: any
-
-  const defaultOptions: OAuthProviderOptions = {
-    serverUrl: 'https://example.com',
-    callbackPort: 8080,
-    host: 'localhost',
-    serverUrlHash: 'test-hash',
-  }
-
-  const tokensWith = (refreshToken: string) => ({
-    access_token: `access-for-${refreshToken}`,
-    token_type: 'Bearer',
-    expires_in: 3600,
-    refresh_token: refreshToken,
-  })
-
-  beforeEach(() => {
-    mockReadJsonFile = vi.mocked(mcpAuthConfig.readJsonFile)
-    mockWriteJsonFile = vi.mocked(mcpAuthConfig.writeJsonFile)
-    mockDeleteConfigFile = vi.mocked(mcpAuthConfig.deleteConfigFile)
-
-    mockReadJsonFile.mockResolvedValue(undefined)
-    mockWriteJsonFile.mockResolvedValue(undefined)
-    mockDeleteConfigFile.mockResolvedValue(undefined)
-
-    provider = new NodeOAuthClientProvider(defaultOptions)
-  })
-
-  afterEach(() => {
-    vi.clearAllMocks()
-  })
-
-  it('deletes tokens when the on-disk refresh token matches the one this process last read', async () => {
-    mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
-    await provider.tokens()
-
-    await provider.invalidateCredentials('tokens')
-
-    expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
-  })
-
-  it('keeps tokens when a concurrent process rotated them after this process read its copy', async () => {
-    // This process loaded refresh-1, refreshed with it, and got invalid_grant because a
-    // concurrent process already rotated it. The winner's refresh-2 is on disk.
-    mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
-    await provider.tokens()
-    mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
-
-    await provider.invalidateCredentials('tokens')
-
-    expect(mockDeleteConfigFile).not.toHaveBeenCalled()
-  })
-
-  it('deletes tokens when this process never read any tokens', async () => {
-    mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
-
-    await provider.invalidateCredentials('tokens')
-
-    expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
-  })
-
-  it('deletes tokens when the token file is gone', async () => {
-    mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
-    await provider.tokens()
-    mockReadJsonFile.mockResolvedValue(undefined)
-
-    await provider.invalidateCredentials('tokens')
-
-    expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
-  })
-
-  it('treats tokens this process saved itself as its own when guarding invalidation', async () => {
-    mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
-    await provider.tokens()
-    // This process wins the refresh race and saves the rotated pair.
-    await provider.saveTokens(tokensWith('refresh-2') as any)
-    mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
-
-    await provider.invalidateCredentials('tokens')
-
-    // Disk matches what we saved, so a later invalid_grant means our grant is dead.
-    expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
   })
 })

@@ -9,7 +9,7 @@ import {
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
 import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
-import { log, debugLog, MCP_REMOTE_VERSION } from './utils'
+import { log, debugLog, DEBUG, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
@@ -192,7 +192,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    */
   async tokens(): Promise<OAuthTokens | undefined> {
     debugLog('Reading OAuth tokens')
-    debugLog('Token request stack trace:', new Error().stack)
+    if (DEBUG) {
+      // Only capture the stack when debugging: tokens() is on the SDK's request hot
+      // path and new Error().stack is evaluated before debugLog can discard it.
+      debugLog('Token request stack trace:', new Error().stack)
+    }
 
     const tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
     this._lastReadRefreshToken = tokens?.refresh_token
@@ -326,7 +330,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         debugLog('Client information invalidated')
         break
 
-      case 'tokens': {
+      case 'tokens':
         if (await this.tokensWereRotatedByAnotherProcess()) {
           // Refresh tokens are single use on rotating servers: when several mcp-remote
           // processes share this token file, the first to refresh wins and the others
@@ -339,7 +343,6 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         await deleteConfigFile(this.serverUrlHash, 'tokens.json')
         debugLog('OAuth tokens invalidated')
         break
-      }
 
       case 'verifier':
         await deleteConfigFile(this.serverUrlHash, 'code_verifier.txt')
@@ -355,6 +358,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * Checks whether the tokens on disk carry a different refresh token than the one
    * this process last read or saved. If so, a concurrent process rotated the tokens
    * after we loaded ours, and the on-disk pair is the live one.
+   *
+   * Heuristic, not a lock: it assumes no tokens() read lands between the failed
+   * refresh and this check, and a later saveTokens by another flow can still
+   * overwrite the kept pair. Both windows are tiny next to a refresh round trip,
+   * and the failure mode is just today's behavior (browser re-auth).
    */
   private async tokensWereRotatedByAnotherProcess(): Promise<boolean> {
     if (!this._lastReadRefreshToken) {

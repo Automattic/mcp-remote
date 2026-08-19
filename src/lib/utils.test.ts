@@ -17,11 +17,18 @@ import path from 'path'
 // All sanitizeUrl tests have been moved to the strict-url-sanitise package
 
 describe('Feature: Command Line Arguments Parsing', () => {
-  // parseCommandLineArgs mutates global.fetch when --socks-proxy or --enable-proxy is passed.
-  // Snapshot once and restore after every test so the alias can't leak into later tests.
+  // parseCommandLineArgs mutates global fetch/Headers/Request/Response when --socks-proxy
+  // or --enable-proxy is passed. Snapshot once and restore after every test so the aliases
+  // can't leak into later tests.
   const originalGlobalFetch = global.fetch
+  const originalGlobalHeaders = global.Headers
+  const originalGlobalRequest = global.Request
+  const originalGlobalResponse = global.Response
   afterEach(() => {
     global.fetch = originalGlobalFetch
+    global.Headers = originalGlobalHeaders
+    global.Request = originalGlobalRequest
+    global.Response = originalGlobalResponse
   })
 
   it('Scenario: Parse basic server URL', async () => {
@@ -518,33 +525,23 @@ describe('Feature: Command Line Arguments Parsing', () => {
     }
   })
 
+  // Global restore for these two tests is handled by the describe-level afterEach above.
+  // See installUndiciGlobals in utils.ts for why all four globals move together.
   it('Scenario: --socks-proxy aliases global fetch and companion classes to npm undici', async () => {
     const undici = await import('undici')
     const { getGlobalDispatcher, setGlobalDispatcher } = undici
     const originalDispatcher = getGlobalDispatcher()
-    const originalFetch = global.fetch
-    const originalHeaders = global.Headers
-    const originalRequest = global.Request
-    const originalResponse = global.Response
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const args = ['https://example.com/sse', '--socks-proxy', 'socks5://127.0.0.1:1080']
       await parseCommandLineArgs(args, 'test usage')
 
       expect(global.fetch).toBe(undici.fetch)
-      // Headers/Request/Response must move together with fetch: the SDK's OAuth error
-      // handling does `response instanceof Response` against the global Response, and a
-      // response from npm undici's fetch fails that check against Node's built-in class.
       expect(global.Headers).toBe(undici.Headers)
       expect(global.Request).toBe(undici.Request)
       expect(global.Response).toBe(undici.Response)
-      expect(new undici.Response('{}') instanceof global.Response).toBe(true)
     } finally {
       setGlobalDispatcher(originalDispatcher)
-      global.fetch = originalFetch
-      global.Headers = originalHeaders
-      global.Request = originalRequest
-      global.Response = originalResponse
       consoleSpy.mockRestore()
     }
   })
@@ -553,10 +550,6 @@ describe('Feature: Command Line Arguments Parsing', () => {
     const undici = await import('undici')
     const { getGlobalDispatcher, setGlobalDispatcher } = undici
     const originalDispatcher = getGlobalDispatcher()
-    const originalFetch = global.fetch
-    const originalHeaders = global.Headers
-    const originalRequest = global.Request
-    const originalResponse = global.Response
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const args = ['https://example.com/sse', '--enable-proxy']
@@ -568,10 +561,6 @@ describe('Feature: Command Line Arguments Parsing', () => {
       expect(global.Response).toBe(undici.Response)
     } finally {
       setGlobalDispatcher(originalDispatcher)
-      global.fetch = originalFetch
-      global.Headers = originalHeaders
-      global.Request = originalRequest
-      global.Response = originalResponse
       consoleSpy.mockRestore()
     }
   })
