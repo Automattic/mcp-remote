@@ -7,7 +7,7 @@ import {
   OAuthTokens,
   OAuthTokensSchema,
 } from '@modelcontextprotocol/sdk/shared/auth.js'
-import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
+import type { OAuthProviderOptions, StaticOAuthClientMetadata, TransportFetchProvider } from './types'
 import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
 import { log, debugLog, MCP_REMOTE_VERSION } from './utils'
@@ -17,10 +17,16 @@ import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } fr
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 
 /**
+ * How many issuances written by transportFetch can be awaiting their saveTokens at once.
+ * Only a leaked marker - an issuance whose save never arrived - is ever evicted.
+ */
+const MAX_PERSISTED_TOKEN_MARKERS = 8
+
+/**
  * Implements the OAuthClientProvider interface for Node.js environments.
  * Handles OAuth flow and token storage for MCP clients.
  */
-export class NodeOAuthClientProvider implements OAuthClientProvider {
+export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFetchProvider {
   private serverUrlHash: string
   private callbackPath: string
   private clientName: string
@@ -204,20 +210,21 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * Anything that is not a refresh grant passes straight through untouched.
    */
   readonly transportFetch: FetchLike = (url, init) => {
-    const requestInit = init
-    const body = requestInit?.body
-    if (!requestInit || !(body instanceof URLSearchParams) || body.get('grant_type') !== 'refresh_token') {
+    const body = init?.body
+    if (!(body instanceof URLSearchParams) || body.get('grant_type') !== 'refresh_token') {
       return globalThis.fetch(url, init)
     }
-    return this.queueRefresh(() => this.sendRefreshGrant(url, requestInit, body))
+    return this.queueRefresh(() => this.sendRefreshGrant(url, init, body))
   }
 
   /**
-   * Runs `work` after every refresh already queued on this provider has settled.
+   * Runs `work` after every refresh already queued on this provider has settled. Runs it
+   * either way, so one failed refresh cannot wedge every later one behind it.
    */
   private queueRefresh<T>(work: () => Promise<T>): Promise<T> {
     const result = this._refreshQueue.then(work, work)
-    // Keep the chain going whichever way this turn ends, and don't let it retain the result.
+    // Mapped to undefined so the queue doesn't pin the resolved Response - and its body -
+    // in memory for the idle hour until the next refresh.
     this._refreshQueue = result.then(
       () => undefined,
       () => undefined,
@@ -233,20 +240,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * to a browser re-authorization, so anything that goes wrong here degrades to sending the
    * request exactly as the SDK built it.
    */
-  private async sendRefreshGrant(url: string | URL, init: RequestInit, body: URLSearchParams): Promise<Response> {
-    try {
-      const onDisk = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
-      if (onDisk?.refresh_token && onDisk.refresh_token !== body.get('refresh_token')) {
-        // Rotated while this attempt waited its turn. Spend the live token rather than the
-        // one the SDK read earlier, which the server has already retired.
-        log('Refresh token was rotated while this refresh was queued - sending the current one instead')
-        body.set('refresh_token', onDisk.refresh_token)
-      }
-    } catch (error) {
-      debugLog('Could not check for a rotated refresh token, sending the request unchanged', { error: String(error) })
-    }
+  private async sendRefreshGrant(url: string | URL, init: RequestInit | undefined, body: URLSearchParams): Promise<Response> {
+    await this.retargetToCurrentToken(body)
 
-    const submitted = body.get('refresh_token') ?? undefined
+    const submitted = body.get('refresh_token')
     const response = await globalThis.fetch(url, init)
     if (!response.ok) {
       return response
@@ -260,12 +257,13 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       }
 
       // A server that does not rotate omits refresh_token, and the token we submitted stays
-      // valid - the same rule the SDK's refreshAuthorization applies.
+      // valid - the same rule the SDK's refreshAuthorization applies. Spread conditionally so
+      // a null from `body.get` cannot land on disk, where the token schema would reject it.
       const tokens = { ...(submitted ? { refresh_token: submitted } : {}), ...refreshed.data }
 
       // Persist before releasing the queue so the next refresh in line reads the pair we
       // just obtained rather than the token we spent.
-      await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+      await this.persistTokens(tokens)
       this.rememberPersistedTokens(tokens.access_token)
 
       // Hand the SDK a body naming the refresh token this request actually used.
@@ -286,8 +284,25 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   }
 
   /**
-   * Marks one issuance that transportFetch has already written, so the saveTokens carrying
-   * that same issuance can recognize a write it does not need to repeat.
+   * Points `body` at the refresh token currently on disk when it has rotated past the one
+   * this attempt was built with, so a queued attempt spends the live token rather than one
+   * the server has already retired.
+   */
+  private async retargetToCurrentToken(body: URLSearchParams): Promise<void> {
+    try {
+      const onDisk = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+      if (onDisk?.refresh_token && onDisk.refresh_token !== body.get('refresh_token')) {
+        log('Refresh token was rotated while this refresh was queued - sending the current one instead')
+        body.set('refresh_token', onDisk.refresh_token)
+      }
+    } catch (error) {
+      debugLog('Could not check for a rotated refresh token, sending the request unchanged', { error: String(error) })
+    }
+  }
+
+  /**
+   * Marks an issuance transportFetch has already written, so the matching saveTokens can
+   * skip repeating the write.
    *
    * Keyed on the access token, which is unique per issuance. The refresh token is not: a
    * server that does not rotate returns the same one every time, so keying on it would
@@ -295,13 +310,42 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * refresh whose write failed would then have its saveTokens fallback wrongly skipped.
    *
    * Markers are one-shot, consumed by the matching save. The cap only cleans up after an
-   * issuance whose save never arrived at all.
+   * issuance whose save never arrived at all, so it just needs to exceed the number of
+   * refreshes that can be awaiting their save at once.
    */
   private rememberPersistedTokens(accessToken: string): void {
-    this._persistedAccessTokens.add(accessToken)
-    while (this._persistedAccessTokens.size > 8) {
-      this._persistedAccessTokens.delete(this._persistedAccessTokens.values().next().value as string)
+    const markers = this._persistedAccessTokens
+    markers.add(accessToken)
+    const [oldest] = markers
+    if (markers.size > MAX_PERSISTED_TOKEN_MARKERS && oldest) {
+      markers.delete(oldest)
     }
+  }
+
+  /**
+   * The one place tokens.json is written, so both the refresh path and the SDK's saveTokens
+   * get the same validation and logging.
+   */
+  private async persistTokens(tokens: OAuthTokens): Promise<void> {
+    const timeLeft = tokens.expires_in || 0
+
+    // Alert if expires_in is invalid
+    if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
+      debugLog('⚠️ WARNING: Invalid expires_in detected in tokens ⚠️', () => ({
+        expiresIn: tokens.expires_in,
+        tokenObject: tokens,
+        stack: new Error('Invalid expires_in value').stack,
+      }))
+    }
+
+    debugLog('Saving tokens', () => ({
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token,
+      expiresIn: `${timeLeft} seconds`,
+      expiresInValue: tokens.expires_in,
+    }))
+
+    await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
   }
 
   /**
@@ -352,37 +396,19 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * @param tokens The tokens to save
    */
   async saveTokens(tokens: OAuthTokens): Promise<void> {
-    // Consumes the marker, so this only ever skips the one save belonging to that issuance.
+    // transportFetch already wrote this pair, inside the refresh queue and using the token
+    // the request actually spent. The SDK calls this afterwards, outside that queue, so a
+    // refresh that has since rotated past this pair would otherwise be undone by it.
+    // Consuming the marker keeps this to the one save that issuance belongs to.
     if (this._persistedAccessTokens.delete(tokens.access_token)) {
-      // transportFetch already wrote this pair, inside the refresh queue and using the token
-      // the request actually spent. The SDK calls this afterwards, outside that queue, so a
-      // refresh that has since rotated past this pair would otherwise be undone by it.
       debugLog('Skipping saveTokens; the refresh that produced these tokens already stored them')
       return
     }
 
-    const timeLeft = tokens.expires_in || 0
-
-    // Alert if expires_in is invalid
-    if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
-      debugLog('⚠️ WARNING: Invalid expires_in detected in tokens ⚠️', () => ({
-        expiresIn: tokens.expires_in,
-        tokenObject: tokens,
-        stack: new Error('Invalid expires_in value').stack,
-      }))
-    }
-
-    debugLog('Saving tokens', () => ({
-      hasAccessToken: !!tokens.access_token,
-      hasRefreshToken: !!tokens.refresh_token,
-      expiresIn: `${timeLeft} seconds`,
-      expiresInValue: tokens.expires_in,
-    }))
-
     // Deliberately leaves _pinnedRefreshToken alone: a concurrent flow may be mid-refresh
     // with the token it pinned, and retiring it here would make that flow's invalidation
     // delete the pair we just wrote. Only invalidateTokens retires the pin.
-    await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+    await this.persistTokens(tokens)
   }
 
   /**
@@ -498,14 +524,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * - A refresh failing for any reason other than invalid_grant never reaches this code, so
    *   the pin survives a network blip and goes stale.
    *
-   * Losing a credential this way costs a browser re-auth. Recovery is also bounded: the SDK
-   * tries a refresh twice per auth() and connectToRemoteServer reconnects once, so about
-   * four attempts. Beyond roughly that many contending processes the connection fails
-   * instead, rather than degrading to a re-auth.
+   * Losing a credential this way costs a browser re-auth, and recovery is bounded at roughly
+   * four attempts - see the rotation-race scenario in utils.oauth.test.ts - beyond which the
+   * connection fails rather than degrading to a re-auth.
    *
-   * Closing all of these means serializing the refresh itself rather than guessing after
-   * the fact - the SDK threads the transport's `fetch` into its token POST, which is where
-   * an in-process mutex plus a cross-process lock would go.
+   * What remains is the cross-process half. It needs a lock around the token file, alongside
+   * the in-process queue transportFetch already holds. That lock would retire this guard,
+   * the InvalidGrantError reconnect in connectToRemoteServer, and the persisted-issuance
+   * markers together - they are three layers of containment for one race.
    */
   private async invalidateTokens(): Promise<void> {
     // Retire the pin up front, so it happens on every path out of here. The next attempt

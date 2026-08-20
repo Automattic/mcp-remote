@@ -2,10 +2,10 @@ import { OAuthClientProvider, UnauthorizedError } from '@modelcontextprotocol/sd
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { Transport, type FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
+import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { InvalidGrantError, OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { OAuthClientInformationFull, OAuthClientInformationFullSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
-import { OAuthCallbackServerOptions, StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './types'
+import { OAuthCallbackServerOptions, StaticOAuthClientInformationFull, StaticOAuthClientMetadata, TransportFetchProvider } from './types'
 import { getConfigDir, getConfigFilePath, readJsonFile } from './mcp-auth-config'
 import {
   discoverProtectedResourceMetadata,
@@ -441,7 +441,7 @@ export type AuthInitializer = () => Promise<{
 export async function connectToRemoteServer(
   client: Client | null,
   serverUrl: string,
-  authProvider: OAuthClientProvider,
+  authProvider: OAuthClientProvider & Partial<TransportFetchProvider>,
   headers: Record<string, string>,
   authInitializer: AuthInitializer,
   transportStrategy: TransportStrategy = 'http-first',
@@ -470,9 +470,8 @@ export async function connectToRemoteServer(
   }
 
   // The SDK threads this all the way into its OAuth token requests. NodeOAuthClientProvider
-  // supplies one that serializes refresh grants within this process; duck-typed so utils
-  // does not have to import the provider that imports it.
-  const transportFetch = (authProvider as { transportFetch?: FetchLike }).transportFetch
+  // supplies one that serializes refresh grants within this process.
+  const transportFetch = authProvider.transportFetch
 
   log(`Using transport strategy: ${transportStrategy}`)
   // Determine if we should attempt to fallback on error

@@ -44,6 +44,15 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     vi.clearAllMocks()
   })
 
+  /** An OAuth token pair. Omitting `refreshToken` models a server that does not rotate. */
+  const pair = (accessToken: string, refreshToken?: string) => ({
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: 3600,
+    ...(refreshToken ? { refresh_token: refreshToken } : {}),
+  })
+  const tokensWith = (refreshToken: string) => pair(`access-for-${refreshToken}`, refreshToken)
+
   describe('scope priority', () => {
     it('should prioritize custom scope from staticOAuthClientMetadata', () => {
       provider = new NodeOAuthClientProvider({
@@ -161,13 +170,6 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     })
 
     describe('rotation guard', () => {
-      const tokensWith = (refreshToken: string) => ({
-        access_token: `access-for-${refreshToken}`,
-        token_type: 'Bearer',
-        expires_in: 3600,
-        refresh_token: refreshToken,
-      })
-
       beforeEach(() => {
         provider = new NodeOAuthClientProvider(defaultOptions)
       })
@@ -288,12 +290,6 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
   describe('refresh grant serialization', () => {
     const tokenUrl = 'https://idp.example.com/token'
-    const tokensWith = (refreshToken: string) => ({
-      access_token: `access-for-${refreshToken}`,
-      token_type: 'Bearer',
-      expires_in: 3600,
-      refresh_token: refreshToken,
-    })
     const refreshBody = (refreshToken: string) => new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken })
     const tokenResponse = (payload: Record<string, unknown>) =>
       new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -320,7 +316,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
     it('sends the token on disk when it has rotated past the one this attempt was built with', async () => {
       mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
-      fetchSpy.mockResolvedValue(tokenResponse({ access_token: 'a3', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-3' }))
+      fetchSpy.mockResolvedValue(tokenResponse(pair('a3', 'refresh-3')))
 
       const body = refreshBody('refresh-1')
       await provider.transportFetch(tokenUrl, { method: 'POST', body })
@@ -333,7 +329,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       // backfills the token it believed it sent - which after a retarget is already spent -
       // so the response has to name the one actually used.
       mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
-      fetchSpy.mockResolvedValue(tokenResponse({ access_token: 'a3', token_type: 'Bearer', expires_in: 3600 }))
+      fetchSpy.mockResolvedValue(tokenResponse(pair('a3')))
 
       const response = await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
 
@@ -345,13 +341,13 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       // saveTokens runs after the queue has been released, so by then a later refresh may
       // have rotated past this pair; rewriting it would put a spent token back on disk.
       mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
-      fetchSpy.mockResolvedValue(tokenResponse({ access_token: 'a2', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' }))
+      fetchSpy.mockResolvedValue(tokenResponse(pair('a2', 'refresh-2')))
 
       await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
       mockWriteJsonFile.mockClear()
 
       // The SDK saves what the response carried, which is the pair the wrapper just wrote.
-      await provider.saveTokens({ access_token: 'a2', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' } as any)
+      await provider.saveTokens(pair('a2', 'refresh-2') as any)
 
       expect(mockWriteJsonFile).not.toHaveBeenCalled()
     })
@@ -359,12 +355,12 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('still saves a pair the refresh could not store itself', async () => {
       mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
       mockWriteJsonFile.mockRejectedValueOnce(new Error('disk full'))
-      fetchSpy.mockResolvedValue(tokenResponse({ access_token: 'a2', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' }))
+      fetchSpy.mockResolvedValue(tokenResponse(pair('a2', 'refresh-2')))
 
       await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
       mockWriteJsonFile.mockClear()
 
-      await provider.saveTokens({ access_token: 'a2', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' } as any)
+      await provider.saveTokens(pair('a2', 'refresh-2') as any)
 
       expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ refresh_token: 'refresh-2' }))
     })
@@ -372,21 +368,21 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('still saves after a failed write when an earlier refresh succeeded on the same token', async () => {
       // A server that does not rotate hands back the same refresh token every time, so a
       // marker keyed on it would still match here and silently drop the new access token.
-      const nonRotating = (accessToken: string) => ({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600 })
       mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
-      fetchSpy.mockResolvedValueOnce(tokenResponse(nonRotating('a2')))
+      fetchSpy.mockResolvedValueOnce(tokenResponse(pair('a2')))
 
-      // First refresh stores its pair, and the save that follows is correctly skipped.
+      // First refresh stores its pair, and the save that follows is skipped as a duplicate.
       await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
-      await provider.saveTokens({ ...nonRotating('a2'), refresh_token: 'refresh-1' } as any)
+      await provider.saveTokens(pair('a2', 'refresh-1') as any)
+      expect(mockWriteJsonFile).toHaveBeenCalledTimes(1)
 
       // Second refresh cannot store its own pair, so saveTokens is the only route to disk.
       mockWriteJsonFile.mockRejectedValueOnce(new Error('disk full'))
-      fetchSpy.mockResolvedValueOnce(tokenResponse(nonRotating('a3')))
+      fetchSpy.mockResolvedValueOnce(tokenResponse(pair('a3')))
       await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
       mockWriteJsonFile.mockClear()
 
-      await provider.saveTokens({ ...nonRotating('a3'), refresh_token: 'refresh-1' } as any)
+      await provider.saveTokens(pair('a3', 'refresh-1') as any)
 
       expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ access_token: 'a3' }))
     })
@@ -398,7 +394,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       fetchSpy.mockImplementation(async () => {
         inFlight += 1
         if (inFlight > 1) overlapped = true
-        await new Promise((resolve) => setTimeout(resolve, 5))
+        await Promise.resolve()
         inFlight -= 1
         return tokenResponse({ access_token: 'a', token_type: 'Bearer', expires_in: 3600 })
       })

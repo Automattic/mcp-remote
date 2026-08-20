@@ -126,6 +126,35 @@ describe('Feature: OAuth flow end-to-end', () => {
     })
   }
 
+  /** Seeds tokens.json with an expired access token, so connecting forces a refresh. */
+  const seedStaleTokens = (serverUrlHash: string, refreshToken: string) =>
+    writeJsonFile(serverUrlHash, 'tokens.json', {
+      access_token: 'stale-access-token',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: refreshToken,
+    })
+
+  /**
+   * Connects two clients through one provider at once - the shape concurrent tool calls
+   * produce, where both flows enter authentication independently against shared token state.
+   */
+  const connectConcurrently = async (label: string, authProvider: NodeOAuthClientProvider) => {
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
+    const clients = ['a', 'b'].map((suffix) => new Client({ name: `${label}-${suffix}`, version: '0.0.0' }, { capabilities: {} }))
+    try {
+      await Promise.all(
+        clients.map((client) => connectToRemoteServer(client, mcp.url('/mcp'), authProvider, {}, authInitializer, 'http-only')),
+      )
+    } finally {
+      for (const client of clients) await client.close()
+    }
+  }
+
+  /** The refresh token tokens.json ends up holding. */
+  const storedRefreshToken = async (serverUrlHash: string) =>
+    (await readJsonFile<any>(serverUrlHash, 'tokens.json', OAuthTokensSchema))?.refresh_token
+
   const makeProvider = ({
     serverUrlHash,
     callbackPort,
@@ -203,13 +232,7 @@ describe('Feature: OAuth flow end-to-end', () => {
     const serverUrlHash = 'concurrent-refresh-test'
     const accessToken = 'access-token-for-all-generations'
 
-    await writeJsonFile(serverUrlHash, 'tokens.json', {
-      access_token: 'stale-access-token',
-      token_type: 'Bearer',
-      expires_in: 3600,
-      refresh_token: 'refresh-1',
-    })
-
+    await seedStaleTokens(serverUrlHash, 'refresh-1')
     serveMcp({ accessToken })
     serveIdpMetadata()
 
@@ -230,22 +253,10 @@ describe('Feature: OAuth flow end-to-end', () => {
       res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: `refresh-${issued}` })
     })
 
-    const authProvider = makeProvider({
-      serverUrlHash,
-      callbackPort: 33421,
-      grantTypes: ['authorization_code', 'refresh_token'],
-    })
+    const authProvider = makeProvider({ serverUrlHash, callbackPort: 33421, grantTypes: ['authorization_code', 'refresh_token'] })
     const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
-    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
 
-    // Two flows sharing one provider, exactly as concurrent tool calls would produce.
-    const clients = [
-      new Client({ name: 'concurrent-a', version: '0.0.0' }, { capabilities: {} }),
-      new Client({ name: 'concurrent-b', version: '0.0.0' }, { capabilities: {} }),
-    ]
-    await Promise.all(
-      clients.map((client) => connectToRemoteServer(client, mcp.url('/mcp'), authProvider, {}, authInitializer, 'http-only')),
-    )
+    await connectConcurrently('concurrent', authProvider)
 
     // Both refreshes were attempted, neither was rejected, and the second was retargeted at
     // the token the first produced rather than replaying the one it spent.
@@ -255,10 +266,7 @@ describe('Feature: OAuth flow end-to-end', () => {
 
     // What actually matters afterwards: disk holds the newest pair. A saveTokens landing
     // after the queue was released must not put an already-spent token back.
-    const stored = await readJsonFile<any>(serverUrlHash, 'tokens.json', OAuthTokensSchema)
-    expect(stored?.refresh_token).toBe(`refresh-${issued}`)
-
-    for (const client of clients) await client.close()
+    expect(await storedRefreshToken(serverUrlHash)).toBe('refresh-3')
   }, 15_000)
 
   it('Scenario: a server that omits refresh_token does not resurrect the spent one', async () => {
@@ -268,18 +276,15 @@ describe('Feature: OAuth flow end-to-end', () => {
     const serverUrlHash = 'omitted-refresh-token-test'
     const accessToken = 'access-token-after-refresh'
 
-    await writeJsonFile(serverUrlHash, 'tokens.json', {
-      access_token: 'stale-access-token',
-      token_type: 'Bearer',
-      expires_in: 3600,
-      refresh_token: 'refresh-1',
-    })
-
+    await seedStaleTokens(serverUrlHash, 'refresh-1')
     serveMcp({ accessToken })
     serveIdpMetadata()
 
-    // Two concurrent flows, so the second is genuinely retargeted: it was built with
-    // refresh-1 but sends refresh-2, and the response carries no refresh token at all.
+    // End-to-end cover for a server that never rotates. Whether the second flow is actually
+    // retargeted depends on whether it read tokens.json before the first flow's write landed,
+    // which is not deterministic here - the guard for the retarget-plus-omit path itself is
+    // 'reports the retargeted token when the server omits refresh_token' in the provider's
+    // unit tests. What this pins down is that the pair left on disk is the live one.
     const presented: string[] = []
     idp.on('POST', '/token', (req, res) => {
       presented.push(req.body.refresh_token)
@@ -289,21 +294,10 @@ describe('Feature: OAuth flow end-to-end', () => {
       res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600 })
     })
 
-    const authProvider = makeProvider({
-      serverUrlHash,
-      callbackPort: 33422,
-      grantTypes: ['authorization_code', 'refresh_token'],
-    })
+    const authProvider = makeProvider({ serverUrlHash, callbackPort: 33422, grantTypes: ['authorization_code', 'refresh_token'] })
     const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
-    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
 
-    const clients = [
-      new Client({ name: 'omitted-a', version: '0.0.0' }, { capabilities: {} }),
-      new Client({ name: 'omitted-b', version: '0.0.0' }, { capabilities: {} }),
-    ]
-    await Promise.all(
-      clients.map((client) => connectToRemoteServer(client, mcp.url('/mcp'), authProvider, {}, authInitializer, 'http-only')),
-    )
+    await connectConcurrently('omitted', authProvider)
 
     expect(presented).toEqual(['refresh-1', 'refresh-2'])
     expect(redirectSpy).not.toHaveBeenCalled()
@@ -313,8 +307,6 @@ describe('Feature: OAuth flow end-to-end', () => {
     const stored = await readJsonFile<any>(serverUrlHash, 'tokens.json', OAuthTokensSchema)
     expect(stored?.refresh_token).toBe('refresh-2')
     expect(stored?.access_token).toBe(accessToken)
-
-    for (const client of clients) await client.close()
   }, 15_000)
 
   it('Scenario: losing the rotation race twice reconnects instead of failing the connection', async () => {

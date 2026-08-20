@@ -1,7 +1,16 @@
 import { EventEmitter } from 'events'
 import { OAuthClientInformationFull, OAuthClientMetadata } from '@modelcontextprotocol/sdk/shared/auth.js'
+import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
+
+/**
+ * An OAuth provider that also supplies the fetch the SDK transports should use, so it can
+ * see - and serialize - the token requests the SDK makes on its behalf.
+ */
+export interface TransportFetchProvider {
+  readonly transportFetch: FetchLike
+}
 
 /**
  * Options for creating an OAuth client provider
