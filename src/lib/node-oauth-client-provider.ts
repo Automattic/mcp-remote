@@ -34,7 +34,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private _clientInfo: OAuthClientInformationFull | undefined
   private _pinnedRefreshToken: string | undefined
   private _refreshQueue: Promise<unknown> = Promise.resolve()
-  private _persistedRefreshTokens = new Set<string>()
+  private _persistedAccessTokens = new Set<string>()
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
@@ -266,7 +266,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       // Persist before releasing the queue so the next refresh in line reads the pair we
       // just obtained rather than the token we spent.
       await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
-      this.rememberPersistedTokens(tokens.refresh_token)
+      this.rememberPersistedTokens(tokens.access_token)
 
       // Hand the SDK a body naming the refresh token this request actually used.
       // refreshAuthorization backfills the token it *believed* it sent, from a variable our
@@ -286,15 +286,21 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   }
 
   /**
-   * Records a pair transportFetch has already written, so saveTokens can recognize a write
-   * it does not need to repeat. Bounded: a late save arrives within milliseconds of its
-   * refresh, so only the most recent handful can ever match.
+   * Marks one issuance that transportFetch has already written, so the saveTokens carrying
+   * that same issuance can recognize a write it does not need to repeat.
+   *
+   * Keyed on the access token, which is unique per issuance. The refresh token is not: a
+   * server that does not rotate returns the same one every time, so keying on it would
+   * conflate successive issuances and leave a marker matching forever - and the first
+   * refresh whose write failed would then have its saveTokens fallback wrongly skipped.
+   *
+   * Markers are one-shot, consumed by the matching save. The cap only cleans up after an
+   * issuance whose save never arrived at all.
    */
-  private rememberPersistedTokens(refreshToken: string | undefined): void {
-    if (!refreshToken) return
-    this._persistedRefreshTokens.add(refreshToken)
-    while (this._persistedRefreshTokens.size > 8) {
-      this._persistedRefreshTokens.delete(this._persistedRefreshTokens.values().next().value as string)
+  private rememberPersistedTokens(accessToken: string): void {
+    this._persistedAccessTokens.add(accessToken)
+    while (this._persistedAccessTokens.size > 8) {
+      this._persistedAccessTokens.delete(this._persistedAccessTokens.values().next().value as string)
     }
   }
 
@@ -346,7 +352,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * @param tokens The tokens to save
    */
   async saveTokens(tokens: OAuthTokens): Promise<void> {
-    if (tokens.refresh_token && this._persistedRefreshTokens.has(tokens.refresh_token)) {
+    // Consumes the marker, so this only ever skips the one save belonging to that issuance.
+    if (this._persistedAccessTokens.delete(tokens.access_token)) {
       // transportFetch already wrote this pair, inside the refresh queue and using the token
       // the request actually spent. The SDK calls this afterwards, outside that queue, so a
       // refresh that has since rotated past this pair would otherwise be undone by it.

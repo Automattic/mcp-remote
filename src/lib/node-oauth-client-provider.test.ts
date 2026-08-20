@@ -350,7 +350,8 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
       mockWriteJsonFile.mockClear()
 
-      await provider.saveTokens(tokensWith('refresh-2') as any)
+      // The SDK saves what the response carried, which is the pair the wrapper just wrote.
+      await provider.saveTokens({ access_token: 'a2', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' } as any)
 
       expect(mockWriteJsonFile).not.toHaveBeenCalled()
     })
@@ -363,9 +364,31 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
       mockWriteJsonFile.mockClear()
 
-      await provider.saveTokens(tokensWith('refresh-2') as any)
+      await provider.saveTokens({ access_token: 'a2', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' } as any)
 
       expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ refresh_token: 'refresh-2' }))
+    })
+
+    it('still saves after a failed write when an earlier refresh succeeded on the same token', async () => {
+      // A server that does not rotate hands back the same refresh token every time, so a
+      // marker keyed on it would still match here and silently drop the new access token.
+      const nonRotating = (accessToken: string) => ({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600 })
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+      fetchSpy.mockResolvedValueOnce(tokenResponse(nonRotating('a2')))
+
+      // First refresh stores its pair, and the save that follows is correctly skipped.
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+      await provider.saveTokens({ ...nonRotating('a2'), refresh_token: 'refresh-1' } as any)
+
+      // Second refresh cannot store its own pair, so saveTokens is the only route to disk.
+      mockWriteJsonFile.mockRejectedValueOnce(new Error('disk full'))
+      fetchSpy.mockResolvedValueOnce(tokenResponse(nonRotating('a3')))
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+      mockWriteJsonFile.mockClear()
+
+      await provider.saveTokens({ ...nonRotating('a3'), refresh_token: 'refresh-1' } as any)
+
+      expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ access_token: 'a3' }))
     })
 
     it('runs queued refreshes one at a time', async () => {
