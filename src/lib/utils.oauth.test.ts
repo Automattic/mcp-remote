@@ -193,6 +193,67 @@ describe('Feature: OAuth flow end-to-end', () => {
     await client.close()
   }, 15_000)
 
+  it('Scenario: concurrent auth flows in one process do not spend the same refresh token', async () => {
+    // The SDK lets concurrent sends enter authentication independently, and they all share
+    // one provider. Both flows below read the same single-use refresh token before either
+    // finishes refreshing, so unserialized they would race each other into invalid_grant
+    // with no other process involved.
+    const serverUrlHash = 'concurrent-refresh-test'
+    const accessToken = 'access-token-for-all-generations'
+
+    await writeJsonFile(serverUrlHash, 'tokens.json', {
+      access_token: 'stale-access-token',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: 'refresh-1',
+    })
+
+    serveMcp({ accessToken })
+    serveIdpMetadata()
+
+    // Single-use refresh tokens: presenting one twice is invalid_grant.
+    const consumed = new Set<string>()
+    let issued = 1
+    let invalidGrants = 0
+    const presented: string[] = []
+    idp.on('POST', '/token', (req, res) => {
+      const presentedToken = req.body.refresh_token
+      presented.push(presentedToken)
+      if (consumed.has(presentedToken)) {
+        invalidGrants += 1
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'refresh token already used' })
+      }
+      consumed.add(presentedToken)
+      issued += 1
+      res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: `refresh-${issued}` })
+    })
+
+    const authProvider = makeProvider({
+      serverUrlHash,
+      callbackPort: 33421,
+      grantTypes: ['authorization_code', 'refresh_token'],
+    })
+    const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
+
+    // Two flows sharing one provider, exactly as concurrent tool calls would produce.
+    const clients = [
+      new Client({ name: 'concurrent-a', version: '0.0.0' }, { capabilities: {} }),
+      new Client({ name: 'concurrent-b', version: '0.0.0' }, { capabilities: {} }),
+    ]
+    await Promise.all(
+      clients.map((client) => connectToRemoteServer(client, mcp.url('/mcp'), authProvider, {}, authInitializer, 'http-only')),
+    )
+
+    // Both refreshes were attempted, neither was rejected, and the second was retargeted at
+    // the token the first produced rather than replaying the one it spent.
+    expect(presented).toEqual(['refresh-1', 'refresh-2'])
+    expect(invalidGrants).toBe(0)
+    expect(redirectSpy).not.toHaveBeenCalled()
+
+    for (const client of clients) await client.close()
+  }, 15_000)
+
   it('Scenario: losing the rotation race twice reconnects instead of failing the connection', async () => {
     // Three processes share one tokens.json against a server with single-use refresh tokens.
     // This one loses the rotation twice: the SDK retries a refresh exactly once after

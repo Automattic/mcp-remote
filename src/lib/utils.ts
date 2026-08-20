@@ -2,7 +2,7 @@ import { OAuthClientProvider, UnauthorizedError } from '@modelcontextprotocol/sd
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import { Transport, type FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { InvalidGrantError, OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { OAuthClientInformationFull, OAuthClientInformationFullSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
 import { OAuthCallbackServerOptions, StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './types'
@@ -469,6 +469,11 @@ export async function connectToRemoteServer(
     },
   }
 
+  // The SDK threads this all the way into its OAuth token requests. NodeOAuthClientProvider
+  // supplies one that serializes refresh grants within this process; duck-typed so utils
+  // does not have to import the provider that imports it.
+  const transportFetch = (authProvider as { transportFetch?: FetchLike }).transportFetch
+
   log(`Using transport strategy: ${transportStrategy}`)
   // Determine if we should attempt to fallback on error
   // Choose transport based on user strategy and recursion history
@@ -481,10 +486,12 @@ export async function connectToRemoteServer(
         authProvider,
         requestInit: { headers },
         eventSourceInit,
+        fetch: transportFetch,
       })
     : new StreamableHTTPClientTransport(url, {
         authProvider,
         requestInit: { headers },
+        fetch: transportFetch,
       })
 
   try {
@@ -503,7 +510,7 @@ export async function connectToRemoteServer(
         // On failure (401), copy `_resourceMetadataUrl` from the throwaway to the main
         // transport so `finishAuth` below can use the per-server PRM URL captured from
         // the WWW-Authenticate header (geelen/mcp-remote#231).
-        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
+        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers }, fetch: transportFetch })
         const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
         try {
           await testClient.connect(testTransport)

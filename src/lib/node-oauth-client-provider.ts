@@ -1,5 +1,6 @@
 import open from 'open'
 import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
+import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
 import {
   OAuthClientInformationFull,
   OAuthClientInformationFullSchema,
@@ -32,6 +33,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private _state: string
   private _clientInfo: OAuthClientInformationFull | undefined
   private _pinnedRefreshToken: string | undefined
+  private _refreshQueue: Promise<unknown> = Promise.resolve()
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
@@ -184,6 +186,85 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Saving client info', { client_id: clientInformation.client_id })
     this._clientInfo = clientInformation
     await writeJsonFile(this.serverUrlHash, 'client_info.json', clientInformation)
+  }
+
+  /**
+   * The fetch to hand the SDK transports. They thread it all the way into their OAuth token
+   * requests, which is the only place this process can see which refresh token a given
+   * attempt is about to spend.
+   *
+   * Refresh grants are serialized here and retargeted at whatever token is current on disk.
+   * The SDK lets concurrent sends enter authentication independently, all sharing this one
+   * provider, so without this two flows would read the same single-use refresh token and
+   * one of them would lose its own race for no reason. Serialization is per provider
+   * instance, which in practice is per process; it does nothing about other mcp-remote
+   * processes sharing the same token file - see invalidateTokens for what covers those.
+   *
+   * Anything that is not a refresh grant passes straight through untouched.
+   */
+  readonly transportFetch: FetchLike = (url, init) => {
+    const requestInit = init
+    const body = requestInit?.body
+    if (!requestInit || !(body instanceof URLSearchParams) || body.get('grant_type') !== 'refresh_token') {
+      return globalThis.fetch(url, init)
+    }
+    return this.queueRefresh(() => this.sendRefreshGrant(url, requestInit, body))
+  }
+
+  /**
+   * Runs `work` after every refresh already queued on this provider has settled.
+   */
+  private queueRefresh<T>(work: () => Promise<T>): Promise<T> {
+    const result = this._refreshQueue.then(work, work)
+    // Keep the chain going whichever way this turn ends, and don't let it retain the result.
+    this._refreshQueue = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+
+  /**
+   * Issues one refresh grant, holding the queue across the whole read-send-persist cycle.
+   *
+   * Neither the retarget nor the write may turn a working refresh into a failure: the SDK
+   * treats an unrecognized error from this call as "refresh unavailable" and falls through
+   * to a browser re-authorization, so anything that goes wrong here degrades to sending the
+   * request exactly as the SDK built it.
+   */
+  private async sendRefreshGrant(url: string | URL, init: RequestInit, body: URLSearchParams): Promise<Response> {
+    try {
+      const onDisk = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+      if (onDisk?.refresh_token && onDisk.refresh_token !== body.get('refresh_token')) {
+        // Rotated while this attempt waited its turn. Spend the live token rather than the
+        // one the SDK read earlier, which the server has already retired.
+        log('Refresh token was rotated while this refresh was queued - sending the current one instead')
+        body.set('refresh_token', onDisk.refresh_token)
+      }
+    } catch (error) {
+      debugLog('Could not check for a rotated refresh token, sending the request unchanged', { error: String(error) })
+    }
+
+    const response = await globalThis.fetch(url, init)
+
+    try {
+      if (response.ok) {
+        // Persist before releasing the queue so the next refresh in line reads the pair we
+        // just obtained instead of the token we spent. saveTokens rewrites the same content
+        // moments later; that duplicate write is harmless. Cloned so the SDK still gets an
+        // unread body.
+        const refreshed = OAuthTokensSchema.safeParse(await response.clone().json())
+        if (refreshed.success) {
+          // Mirrors the SDK: a server that does not rotate omits refresh_token, and the old
+          // one stays valid.
+          await writeJsonFile(this.serverUrlHash, 'tokens.json', { refresh_token: body.get('refresh_token'), ...refreshed.data })
+        }
+      }
+    } catch (error) {
+      debugLog('Could not persist the refreshed tokens, leaving that to saveTokens', { error: String(error) })
+    }
+
+    return response
   }
 
   /**
@@ -359,19 +440,26 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    *
    * This is a heuristic, not mutual exclusion, and the remaining gaps are deliberate:
    *
-   * - The pin is per-provider, not per-refresh-attempt. The SDK exposes no attempt handle,
-   *   so the two coincide only while at most one refresh is in flight.
+   * - The pin is per-provider, not per-refresh-attempt, because the SDK exposes no attempt
+   *   handle. transportFetch serializes this process's refreshes so at most one attempt is
+   *   ever outstanding against it, which is what makes the two equivalent here. Two
+   *   providers for one server in a single process would break that assumption.
    * - Refreshes are not serialized across processes. N processes waking together still
-   *   produce N rotations per expiry event; this only keeps that from being fatal.
-   * - The read below and the delete are not atomic, so a writer landing between them still
-   *   loses its fresh pair. Atomic config writes remove torn reads as a cause of that, but
-   *   not the window itself.
+   *   produce N rotations per expiry event.
+   * - The read below and the delete are not atomic. A winner renaming its rotated pair into
+   *   place between them still loses it. Atomic config writes remove torn reads as a cause
+   *   of a wrong answer here, but not this window.
    * - A refresh failing for any reason other than invalid_grant never reaches this code, so
    *   the pin survives a network blip and goes stale.
    *
-   * Each of those costs at most one browser re-auth, the behavior we already tolerate.
-   * Closing them properly means observing the refresh request itself - the SDK threads a
-   * `fetch` from the transport into its token POST - and serializing on that.
+   * Losing a credential this way costs a browser re-auth. Recovery is also bounded: the SDK
+   * tries a refresh twice per auth() and connectToRemoteServer reconnects once, so about
+   * four attempts. Beyond roughly that many contending processes the connection fails
+   * instead, rather than degrading to a re-auth.
+   *
+   * Closing all of these means serializing the refresh itself rather than guessing after
+   * the fact - the SDK threads the transport's `fetch` into its token POST, which is where
+   * an in-process mutex plus a cross-process lock would go.
    */
   private async invalidateTokens(): Promise<void> {
     // Retire the pin up front, so it happens on every path out of here. The next attempt
