@@ -6,8 +6,10 @@ import { randomBytes } from 'crypto'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
 
+import { OAuthTokensSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
+
 import { connectToRemoteServer } from './utils'
-import { writeJsonFile } from './mcp-auth-config'
+import { readJsonFile, writeJsonFile } from './mcp-auth-config'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import { useTempConfigDir } from './test-support'
 import type { OAuthProviderOptions } from './types'
@@ -250,6 +252,67 @@ describe('Feature: OAuth flow end-to-end', () => {
     expect(presented).toEqual(['refresh-1', 'refresh-2'])
     expect(invalidGrants).toBe(0)
     expect(redirectSpy).not.toHaveBeenCalled()
+
+    // What actually matters afterwards: disk holds the newest pair. A saveTokens landing
+    // after the queue was released must not put an already-spent token back.
+    const stored = await readJsonFile<any>(serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    expect(stored?.refresh_token).toBe(`refresh-${issued}`)
+
+    for (const client of clients) await client.close()
+  }, 15_000)
+
+  it('Scenario: a server that omits refresh_token does not resurrect the spent one', async () => {
+    // OAuth permits a refresh response with no new refresh token. The SDK backfills the one
+    // it believed it sent, so after a retarget that value is already spent - and it is what
+    // reaches saveTokens.
+    const serverUrlHash = 'omitted-refresh-token-test'
+    const accessToken = 'access-token-after-refresh'
+
+    await writeJsonFile(serverUrlHash, 'tokens.json', {
+      access_token: 'stale-access-token',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: 'refresh-1',
+    })
+
+    serveMcp({ accessToken })
+    serveIdpMetadata()
+
+    // Two concurrent flows, so the second is genuinely retargeted: it was built with
+    // refresh-1 but sends refresh-2, and the response carries no refresh token at all.
+    const presented: string[] = []
+    idp.on('POST', '/token', (req, res) => {
+      presented.push(req.body.refresh_token)
+      if (presented.length === 1) {
+        return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' })
+      }
+      res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600 })
+    })
+
+    const authProvider = makeProvider({
+      serverUrlHash,
+      callbackPort: 33422,
+      grantTypes: ['authorization_code', 'refresh_token'],
+    })
+    const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
+
+    const clients = [
+      new Client({ name: 'omitted-a', version: '0.0.0' }, { capabilities: {} }),
+      new Client({ name: 'omitted-b', version: '0.0.0' }, { capabilities: {} }),
+    ]
+    await Promise.all(
+      clients.map((client) => connectToRemoteServer(client, mcp.url('/mcp'), authProvider, {}, authInitializer, 'http-only')),
+    )
+
+    expect(presented).toEqual(['refresh-1', 'refresh-2'])
+    expect(redirectSpy).not.toHaveBeenCalled()
+
+    // refresh-2 is the live token. The SDK backfilled refresh-1 for the second flow, and
+    // letting that reach disk would leave a spent token for the next refresh to present.
+    const stored = await readJsonFile<any>(serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    expect(stored?.refresh_token).toBe('refresh-2')
+    expect(stored?.access_token).toBe(accessToken)
 
     for (const client of clients) await client.close()
   }, 15_000)

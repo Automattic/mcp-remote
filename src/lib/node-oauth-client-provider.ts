@@ -34,6 +34,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private _clientInfo: OAuthClientInformationFull | undefined
   private _pinnedRefreshToken: string | undefined
   private _refreshQueue: Promise<unknown> = Promise.resolve()
+  private _persistedRefreshTokens = new Set<string>()
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
@@ -245,26 +246,56 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       debugLog('Could not check for a rotated refresh token, sending the request unchanged', { error: String(error) })
     }
 
+    const submitted = body.get('refresh_token') ?? undefined
     const response = await globalThis.fetch(url, init)
-
-    try {
-      if (response.ok) {
-        // Persist before releasing the queue so the next refresh in line reads the pair we
-        // just obtained instead of the token we spent. saveTokens rewrites the same content
-        // moments later; that duplicate write is harmless. Cloned so the SDK still gets an
-        // unread body.
-        const refreshed = OAuthTokensSchema.safeParse(await response.clone().json())
-        if (refreshed.success) {
-          // Mirrors the SDK: a server that does not rotate omits refresh_token, and the old
-          // one stays valid.
-          await writeJsonFile(this.serverUrlHash, 'tokens.json', { refresh_token: body.get('refresh_token'), ...refreshed.data })
-        }
-      }
-    } catch (error) {
-      debugLog('Could not persist the refreshed tokens, leaving that to saveTokens', { error: String(error) })
+    if (!response.ok) {
+      return response
     }
 
-    return response
+    try {
+      // Cloned so the SDK still gets an unread body if anything below bails out.
+      const refreshed = OAuthTokensSchema.safeParse(await response.clone().json())
+      if (!refreshed.success) {
+        return response
+      }
+
+      // A server that does not rotate omits refresh_token, and the token we submitted stays
+      // valid - the same rule the SDK's refreshAuthorization applies.
+      const tokens = { ...(submitted ? { refresh_token: submitted } : {}), ...refreshed.data }
+
+      // Persist before releasing the queue so the next refresh in line reads the pair we
+      // just obtained rather than the token we spent.
+      await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+      this.rememberPersistedTokens(tokens.refresh_token)
+
+      // Hand the SDK a body naming the refresh token this request actually used.
+      // refreshAuthorization backfills the token it *believed* it sent, from a variable our
+      // retarget cannot reach, so after a retarget that value is one the server has already
+      // retired - and it is what would otherwise reach saveTokens.
+      return new Response(JSON.stringify(tokens), {
+        status: response.status,
+        statusText: response.statusText,
+        // Deliberately not forwarding the original headers: their content-length describes
+        // the body we just replaced.
+        headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' },
+      })
+    } catch (error) {
+      debugLog('Could not persist the refreshed tokens, leaving that to saveTokens', { error: String(error) })
+      return response
+    }
+  }
+
+  /**
+   * Records a pair transportFetch has already written, so saveTokens can recognize a write
+   * it does not need to repeat. Bounded: a late save arrives within milliseconds of its
+   * refresh, so only the most recent handful can ever match.
+   */
+  private rememberPersistedTokens(refreshToken: string | undefined): void {
+    if (!refreshToken) return
+    this._persistedRefreshTokens.add(refreshToken)
+    while (this._persistedRefreshTokens.size > 8) {
+      this._persistedRefreshTokens.delete(this._persistedRefreshTokens.values().next().value as string)
+    }
   }
 
   /**
@@ -315,6 +346,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * @param tokens The tokens to save
    */
   async saveTokens(tokens: OAuthTokens): Promise<void> {
+    if (tokens.refresh_token && this._persistedRefreshTokens.has(tokens.refresh_token)) {
+      // transportFetch already wrote this pair, inside the refresh queue and using the token
+      // the request actually spent. The SDK calls this afterwards, outside that queue, so a
+      // refresh that has since rotated past this pair would otherwise be undone by it.
+      debugLog('Skipping saveTokens; the refresh that produced these tokens already stored them')
+      return
+    }
+
     const timeLeft = tokens.expires_in || 0
 
     // Alert if expires_in is invalid

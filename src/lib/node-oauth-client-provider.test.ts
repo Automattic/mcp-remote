@@ -286,6 +286,110 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     })
   })
 
+  describe('refresh grant serialization', () => {
+    const tokenUrl = 'https://idp.example.com/token'
+    const tokensWith = (refreshToken: string) => ({
+      access_token: `access-for-${refreshToken}`,
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: refreshToken,
+    })
+    const refreshBody = (refreshToken: string) => new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken })
+    const tokenResponse = (payload: Record<string, unknown>) =>
+      new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } })
+
+    let fetchSpy: any
+
+    beforeEach(() => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      fetchSpy = vi.spyOn(globalThis, 'fetch')
+    })
+
+    afterEach(() => {
+      fetchSpy.mockRestore()
+    })
+
+    it('leaves anything that is not a refresh grant untouched', async () => {
+      fetchSpy.mockResolvedValue(tokenResponse({ ok: true }))
+
+      await provider.transportFetch('https://example.com/mcp', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0' }) })
+
+      expect(fetchSpy).toHaveBeenCalledOnce()
+      expect(mockWriteJsonFile).not.toHaveBeenCalled()
+    })
+
+    it('sends the token on disk when it has rotated past the one this attempt was built with', async () => {
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+      fetchSpy.mockResolvedValue(tokenResponse({ access_token: 'a3', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-3' }))
+
+      const body = refreshBody('refresh-1')
+      await provider.transportFetch(tokenUrl, { method: 'POST', body })
+
+      expect(body.get('refresh_token')).toBe('refresh-2')
+    })
+
+    it('reports the retargeted token when the server omits refresh_token', async () => {
+      // OAuth lets a server answer a refresh without a new refresh token. The SDK then
+      // backfills the token it believed it sent - which after a retarget is already spent -
+      // so the response has to name the one actually used.
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+      fetchSpy.mockResolvedValue(tokenResponse({ access_token: 'a3', token_type: 'Bearer', expires_in: 3600 }))
+
+      const response = await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+
+      expect(await response.json()).toMatchObject({ access_token: 'a3', refresh_token: 'refresh-2' })
+      expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ refresh_token: 'refresh-2' }))
+    })
+
+    it('does not let the SDK re-save a pair the refresh already stored', async () => {
+      // saveTokens runs after the queue has been released, so by then a later refresh may
+      // have rotated past this pair; rewriting it would put a spent token back on disk.
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+      fetchSpy.mockResolvedValue(tokenResponse({ access_token: 'a2', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' }))
+
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+      mockWriteJsonFile.mockClear()
+
+      await provider.saveTokens(tokensWith('refresh-2') as any)
+
+      expect(mockWriteJsonFile).not.toHaveBeenCalled()
+    })
+
+    it('still saves a pair the refresh could not store itself', async () => {
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+      mockWriteJsonFile.mockRejectedValueOnce(new Error('disk full'))
+      fetchSpy.mockResolvedValue(tokenResponse({ access_token: 'a2', token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' }))
+
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+      mockWriteJsonFile.mockClear()
+
+      await provider.saveTokens(tokensWith('refresh-2') as any)
+
+      expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ refresh_token: 'refresh-2' }))
+    })
+
+    it('runs queued refreshes one at a time', async () => {
+      mockReadJsonFile.mockResolvedValue(undefined)
+      let inFlight = 0
+      let overlapped = false
+      fetchSpy.mockImplementation(async () => {
+        inFlight += 1
+        if (inFlight > 1) overlapped = true
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        inFlight -= 1
+        return tokenResponse({ access_token: 'a', token_type: 'Bearer', expires_in: 3600 })
+      })
+
+      await Promise.all([
+        provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') }),
+        provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') }),
+        provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') }),
+      ])
+
+      expect(overlapped).toBe(false)
+    })
+  })
+
   describe('scopes_supported parsing', () => {
     it('should use custom scopes without filtering', () => {
       const metadata: AuthorizationServerMetadata = {
