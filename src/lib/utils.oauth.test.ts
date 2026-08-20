@@ -2,15 +2,16 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import express from 'express'
 import type { Server } from 'http'
 import type { AddressInfo } from 'net'
-import * as os from 'os'
-import * as path from 'path'
-import * as fs from 'fs/promises'
 import { randomBytes } from 'crypto'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
 
+import { OAuthTokensSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
+
 import { connectToRemoteServer } from './utils'
+import { readJsonFile, writeJsonFile } from './mcp-auth-config'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
+import { useTempConfigDir } from './test-support'
 import type { OAuthProviderOptions } from './types'
 
 // Stands up a real express server on an ephemeral port and lets each test register handlers.
@@ -54,50 +55,52 @@ class MockServer {
 describe('Feature: OAuth flow end-to-end', () => {
   let mcp: MockServer
   let idp: MockServer
-  let tmpConfigDir: string
-  let originalConfigDirEnv: string | undefined
+
+  useTempConfigDir()
 
   beforeEach(async () => {
     mcp = new MockServer()
     idp = new MockServer()
     await mcp.start()
     await idp.start()
-
-    tmpConfigDir = path.join(os.tmpdir(), `mcp-remote-test-${randomBytes(6).toString('hex')}`)
-    await fs.mkdir(tmpConfigDir, { recursive: true })
-    originalConfigDirEnv = process.env.MCP_REMOTE_CONFIG_DIR
-    process.env.MCP_REMOTE_CONFIG_DIR = tmpConfigDir
   })
 
   afterEach(async () => {
     await mcp.stop()
     await idp.stop()
-    if (originalConfigDirEnv === undefined) {
-      delete process.env.MCP_REMOTE_CONFIG_DIR
-    } else {
-      process.env.MCP_REMOTE_CONFIG_DIR = originalConfigDirEnv
-    }
-    await fs.rm(tmpConfigDir, { recursive: true, force: true })
   })
 
-  it('Scenario: completes auth, reconnects with fresh transport, and serves a tools/list request', async () => {
-    const mcpServerUrl = mcp.url('/mcp')
-    const resourceMetadataUrl = mcp.url('/per-server/oauth-protected-resource')
-    const accessToken = 'test-access-token-' + randomBytes(4).toString('hex')
+  /** Minimal RFC 8414 metadata, mounted at the root so the SDK's well-known discovery finds it. */
+  const serveIdpMetadata = () => {
+    idp.on('GET', '/.well-known/oauth-authorization-server', (_req, res) => {
+      res.json({
+        issuer: idp.baseUrl,
+        authorization_endpoint: idp.url('/authorize'),
+        token_endpoint: idp.url('/token'),
+        response_types_supported: ['code'],
+        code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: ['none'],
+      })
+    })
+  }
 
-    // mcp server: 401 with WWW-Authenticate → after auth, real initialize + tools/list responses.
-    let unauthenticatedPosts = 0
+  /**
+   * An MCP endpoint that 401s without the expected bearer token and otherwise answers
+   * initialize and tools/list. `onUnauthenticated` observes rejected requests.
+   */
+  const serveMcp = ({ accessToken, onUnauthenticated }: { accessToken: string; onUnauthenticated?: () => void }) => {
+    const resourceMetadataUrl = mcp.url('/per-server/oauth-protected-resource')
+
     mcp.on('POST', '/mcp', (req, res) => {
       const authHeader = req.headers.authorization
-      if (!authHeader) unauthenticatedPosts += 1
-      if (!authHeader) {
+      // A missing token and a stale one both get 401 + WWW-Authenticate, as a real resource
+      // server does - that header is what starts the SDK's auth flow.
+      if (authHeader !== `Bearer ${accessToken}`) {
+        if (!authHeader) onUnauthenticated?.()
         return res
           .status(401)
           .header('WWW-Authenticate', `Bearer realm="mcp", resource_metadata="${resourceMetadataUrl}"`)
           .json({ error: 'Unauthorized' })
-      }
-      if (authHeader !== `Bearer ${accessToken}`) {
-        return res.status(403).json({ error: 'Forbidden' })
       }
       const body = req.body
       const respond = (result: unknown) => res.header('content-type', 'application/json').json({ jsonrpc: '2.0', id: body.id, result })
@@ -119,24 +122,72 @@ describe('Feature: OAuth flow end-to-end', () => {
     // intentionally do NOT serve the bare /.well-known/oauth-protected-resource path so
     // that any code that drops the per-server URL falls back to a 404 and fails.
     mcp.on('GET', '/per-server/oauth-protected-resource', (_req, res) => {
-      res.json({
-        resource: mcpServerUrl,
-        authorization_servers: [idp.baseUrl],
-      })
+      res.json({ resource: mcp.url('/mcp'), authorization_servers: [idp.baseUrl] })
+    })
+  }
+
+  /** Seeds tokens.json with an expired access token, so connecting forces a refresh. */
+  const seedStaleTokens = (serverUrlHash: string, refreshToken: string) =>
+    writeJsonFile(serverUrlHash, 'tokens.json', {
+      access_token: 'stale-access-token',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: refreshToken,
     })
 
-    // idp server: minimal RFC 8414 metadata + token endpoint. Mounted at root so the SDK's
-    // well-known discovery (which uses the issuer's origin) finds the metadata on the first try.
-    idp.on('GET', '/.well-known/oauth-authorization-server', (_req, res) => {
-      res.json({
-        issuer: idp.baseUrl,
-        authorization_endpoint: idp.url('/authorize'),
-        token_endpoint: idp.url('/token'),
-        response_types_supported: ['code'],
-        code_challenge_methods_supported: ['S256'],
-        token_endpoint_auth_methods_supported: ['none'],
-      })
+  /**
+   * Connects two clients through one provider at once - the shape concurrent tool calls
+   * produce, where both flows enter authentication independently against shared token state.
+   */
+  const connectConcurrently = async (label: string, authProvider: NodeOAuthClientProvider) => {
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
+    const clients = ['a', 'b'].map((suffix) => new Client({ name: `${label}-${suffix}`, version: '0.0.0' }, { capabilities: {} }))
+    try {
+      await Promise.all(
+        clients.map((client) => connectToRemoteServer(client, mcp.url('/mcp'), authProvider, {}, authInitializer, 'http-only')),
+      )
+    } finally {
+      for (const client of clients) await client.close()
+    }
+  }
+
+  /** The refresh token tokens.json ends up holding. */
+  const storedRefreshToken = async (serverUrlHash: string) =>
+    (await readJsonFile<any>(serverUrlHash, 'tokens.json', OAuthTokensSchema))?.refresh_token
+
+  const makeProvider = ({
+    serverUrlHash,
+    callbackPort,
+    grantTypes = ['authorization_code'],
+  }: {
+    serverUrlHash: string
+    callbackPort: number
+    grantTypes?: string[]
+  }) => {
+    const callbackPath = '/oauth/callback'
+    return new NodeOAuthClientProvider(<OAuthProviderOptions>{
+      serverUrl: mcp.url('/mcp'),
+      serverUrlHash,
+      callbackPort,
+      host: 'localhost',
+      callbackPath,
+      staticOAuthClientInfo: {
+        client_id: 'test-client-id',
+        redirect_uris: [`http://localhost:${callbackPort}${callbackPath}`],
+        token_endpoint_auth_method: 'none',
+        grant_types: grantTypes,
+        response_types: ['code'],
+      },
     })
+  }
+
+  it('Scenario: completes auth, reconnects with fresh transport, and serves a tools/list request', async () => {
+    const mcpServerUrl = mcp.url('/mcp')
+    const accessToken = 'test-access-token-' + randomBytes(4).toString('hex')
+
+    let unauthenticatedPosts = 0
+    serveMcp({ accessToken, onUnauthenticated: () => (unauthenticatedPosts += 1) })
+    serveIdpMetadata()
     idp.on('POST', '/token', (req, res) => {
       // Validate redirect_uri matches what was registered — otherwise the test would silently
       // pass even if NodeOAuthClientProvider.redirectUrl diverged from the static redirect_uris.
@@ -147,22 +198,8 @@ describe('Feature: OAuth flow end-to-end', () => {
     })
 
     const callbackPort = 33418
-    const callbackPath = '/oauth/callback'
-    const redirectUri = `http://localhost:${callbackPort}${callbackPath}`
-    const authProvider = new NodeOAuthClientProvider(<OAuthProviderOptions>{
-      serverUrl: mcpServerUrl,
-      serverUrlHash: 'oauth-flow-test',
-      callbackPort,
-      host: 'localhost',
-      callbackPath,
-      staticOAuthClientInfo: {
-        client_id: 'test-client-id',
-        redirect_uris: [redirectUri],
-        token_endpoint_auth_method: 'none',
-        grant_types: ['authorization_code'],
-        response_types: ['code'],
-      },
-    })
+    const redirectUri = `http://localhost:${callbackPort}/oauth/callback`
+    const authProvider = makeProvider({ serverUrlHash: 'oauth-flow-test', callbackPort })
     vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
 
     const authInitializer = vi.fn().mockResolvedValue({
@@ -183,6 +220,153 @@ describe('Feature: OAuth flow end-to-end', () => {
     // Exactly one unauthenticated POST should hit the server — the initial probe. A second
     // would mean we re-probed after auth instead of using the freshly-issued Bearer token.
     expect(unauthenticatedPosts).toBe(1)
+
+    await client.close()
+  }, 15_000)
+
+  it('Scenario: concurrent auth flows in one process do not spend the same refresh token', async () => {
+    // The SDK lets concurrent sends enter authentication independently, and they all share
+    // one provider. Both flows below read the same single-use refresh token before either
+    // finishes refreshing, so unserialized they would race each other into invalid_grant
+    // with no other process involved.
+    const serverUrlHash = 'concurrent-refresh-test'
+    const accessToken = 'access-token-for-all-generations'
+
+    await seedStaleTokens(serverUrlHash, 'refresh-1')
+    serveMcp({ accessToken })
+    serveIdpMetadata()
+
+    // Single-use refresh tokens: presenting one twice is invalid_grant.
+    const consumed = new Set<string>()
+    let issued = 1
+    let invalidGrants = 0
+    const presented: string[] = []
+    idp.on('POST', '/token', (req, res) => {
+      const presentedToken = req.body.refresh_token
+      presented.push(presentedToken)
+      if (consumed.has(presentedToken)) {
+        invalidGrants += 1
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'refresh token already used' })
+      }
+      consumed.add(presentedToken)
+      issued += 1
+      res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: `refresh-${issued}` })
+    })
+
+    const authProvider = makeProvider({ serverUrlHash, callbackPort: 33421, grantTypes: ['authorization_code', 'refresh_token'] })
+    const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
+
+    await connectConcurrently('concurrent', authProvider)
+
+    // Both refreshes were attempted, neither was rejected, and the second was retargeted at
+    // the token the first produced rather than replaying the one it spent.
+    expect(presented).toEqual(['refresh-1', 'refresh-2'])
+    expect(invalidGrants).toBe(0)
+    expect(redirectSpy).not.toHaveBeenCalled()
+
+    // What actually matters afterwards: disk holds the newest pair. A saveTokens landing
+    // after the queue was released must not put an already-spent token back.
+    expect(await storedRefreshToken(serverUrlHash)).toBe('refresh-3')
+  }, 15_000)
+
+  it('Scenario: a server that omits refresh_token does not resurrect the spent one', async () => {
+    // OAuth permits a refresh response with no new refresh token. The SDK backfills the one
+    // it believed it sent, so after a retarget that value is already spent - and it is what
+    // reaches saveTokens.
+    const serverUrlHash = 'omitted-refresh-token-test'
+    const accessToken = 'access-token-after-refresh'
+
+    await seedStaleTokens(serverUrlHash, 'refresh-1')
+    serveMcp({ accessToken })
+    serveIdpMetadata()
+
+    // End-to-end cover for a server that never rotates. Whether the second flow is actually
+    // retargeted depends on whether it read tokens.json before the first flow's write landed,
+    // which is not deterministic here - the guard for the retarget-plus-omit path itself is
+    // 'reports the retargeted token when the server omits refresh_token' in the provider's
+    // unit tests. What this pins down is that the pair left on disk is the live one.
+    const presented: string[] = []
+    idp.on('POST', '/token', (req, res) => {
+      presented.push(req.body.refresh_token)
+      if (presented.length === 1) {
+        return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-2' })
+      }
+      res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600 })
+    })
+
+    const authProvider = makeProvider({ serverUrlHash, callbackPort: 33422, grantTypes: ['authorization_code', 'refresh_token'] })
+    const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
+
+    await connectConcurrently('omitted', authProvider)
+
+    expect(presented).toEqual(['refresh-1', 'refresh-2'])
+    expect(redirectSpy).not.toHaveBeenCalled()
+
+    // refresh-2 is the live token. The SDK backfilled refresh-1 for the second flow, and
+    // letting that reach disk would leave a spent token for the next refresh to present.
+    const stored = await readJsonFile<any>(serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    expect(stored?.refresh_token).toBe('refresh-2')
+    expect(stored?.access_token).toBe(accessToken)
+  }, 15_000)
+
+  it('Scenario: losing the rotation race twice reconnects instead of failing the connection', async () => {
+    // Three processes share one tokens.json against a server with single-use refresh tokens.
+    // This one loses the rotation twice: the SDK retries a refresh exactly once after
+    // invalid_grant, so the second loss escapes auth() entirely. It must reconnect onto the
+    // surviving process's tokens rather than dying or opening a browser.
+    const serverUrlHash = 'rotation-race-test'
+    const mcpServerUrl = mcp.url('/mcp')
+    const goodAccessToken = 'access-after-recovery'
+
+    await writeJsonFile(serverUrlHash, 'tokens.json', {
+      access_token: 'stale-access-token',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: 'refresh-1',
+    })
+
+    serveMcp({ accessToken: goodAccessToken })
+    serveIdpMetadata()
+
+    // Single-use rotation. The first two presented tokens have already been spent by other
+    // processes, which each left their rotated pair on disk before we got here.
+    const spentBy: Record<string, string> = { 'refresh-1': 'refresh-2', 'refresh-2': 'refresh-3' }
+    const presentedRefreshTokens: string[] = []
+    idp.on('POST', '/token', async (req, res) => {
+      presentedRefreshTokens.push(req.body.refresh_token)
+      const alreadyRotatedTo = spentBy[req.body.refresh_token]
+      if (alreadyRotatedTo) {
+        await writeJsonFile(serverUrlHash, 'tokens.json', {
+          access_token: `access-for-${alreadyRotatedTo}`,
+          token_type: 'Bearer',
+          expires_in: 3600,
+          refresh_token: alreadyRotatedTo,
+        })
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'refresh token already used' })
+      }
+      res.json({ access_token: goodAccessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-4' })
+    })
+
+    const authProvider = makeProvider({
+      serverUrlHash,
+      callbackPort: 33420,
+      grantTypes: ['authorization_code', 'refresh_token'],
+    })
+    const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
+
+    const client = new Client({ name: 'rotation-race-test', version: '0.0.0' }, { capabilities: {} })
+    const transport = await connectToRemoteServer(client, mcpServerUrl, authProvider, {}, authInitializer, 'http-only')
+    expect(transport).toBeDefined()
+
+    const tools = await client.request({ method: 'tools/list' }, ListToolsResultSchema)
+    expect(tools.tools.map((t) => t.name)).toEqual(['echo'])
+
+    // Each attempt presented the token that was current on disk at the time: ours, then the
+    // first winner's, then the second winner's — which finally succeeded.
+    expect(presentedRefreshTokens).toEqual(['refresh-1', 'refresh-2', 'refresh-3'])
+    // No browser. That is the whole point: the credentials were live the entire time.
+    expect(redirectSpy).not.toHaveBeenCalled()
 
     await client.close()
   }, 15_000)
@@ -224,20 +408,7 @@ describe('Feature: OAuth flow end-to-end', () => {
       return res.status(202).end()
     })
 
-    const authProvider = new NodeOAuthClientProvider(<OAuthProviderOptions>{
-      serverUrl: mcp.url('/mcp'),
-      serverUrlHash: 'proxy-session-leak-test',
-      callbackPort: 33419,
-      host: 'localhost',
-      callbackPath: '/oauth/callback',
-      staticOAuthClientInfo: {
-        client_id: 'noop-client-id',
-        redirect_uris: ['http://localhost:33419/oauth/callback'],
-        token_endpoint_auth_method: 'none',
-        grant_types: ['authorization_code'],
-        response_types: ['code'],
-      },
-    })
+    const authProvider = makeProvider({ serverUrlHash: 'proxy-session-leak-test', callbackPort: 33419 })
     const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
 
     // Proxy path: client === null.

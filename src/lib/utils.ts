@@ -3,9 +3,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
-import { OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
+import { InvalidGrantError, OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { OAuthClientInformationFull, OAuthClientInformationFullSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
-import { OAuthCallbackServerOptions, StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './types'
+import { OAuthCallbackServerOptions, StaticOAuthClientInformationFull, StaticOAuthClientMetadata, TransportFetchProvider } from './types'
 import { getConfigDir, getConfigFilePath, readJsonFile } from './mcp-auth-config'
 import {
   discoverProtectedResourceMetadata,
@@ -21,7 +21,7 @@ import fs from 'fs'
 import { readFile, rm } from 'fs/promises'
 import path from 'path'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
-import { EnvHttpProxyAgent, fetch, Headers, RequestInit, setGlobalDispatcher } from 'undici'
+import { EnvHttpProxyAgent, fetch, Headers, Request, RequestInit, Response, setGlobalDispatcher } from 'undici'
 import { createSocksDispatcher, redactProxyUrl } from './socks-dispatcher'
 
 // Global type declaration for typescript
@@ -32,6 +32,7 @@ declare global {
 // Connection constants
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
+export const REASON_TOKENS_ROTATED = 'tokens-rotated-by-concurrent-process'
 
 // Transport strategy types
 export type TransportStrategy = 'sse-only' | 'http-only' | 'sse-first' | 'http-first'
@@ -48,9 +49,18 @@ function getTimestamp(): string {
   return now.toISOString()
 }
 
-// Debug logging function
-export function debugLog(message: string, ...args: any[]) {
+/**
+ * Debug logging function.
+ *
+ * Arguments may be passed as thunks, which are only invoked once DEBUG is known to be on.
+ * Callers on hot paths should use that form: a plain argument is built by the caller before
+ * this function can discard it, so an eager `new Error().stack` or `JSON.stringify` costs
+ * its full price on every call even when debug logging is off.
+ */
+export function debugLog(message: string, ...args: Array<unknown | (() => unknown)>) {
   if (!DEBUG) return
+
+  args = args.map((arg) => (typeof arg === 'function' ? (arg as () => unknown)() : arg))
 
   const serverUrlHash = global.currentServerUrlHash
   if (!serverUrlHash) {
@@ -126,9 +136,16 @@ export function createMessageTransformer({
     return transformResponseFunction?.(originalRequest, message) ?? message
   }
 
+  // For requests that will never get a response - a forward that failed, say. The entry
+  // would otherwise sit in the map for the lifetime of the process.
+  const forgetRequest = (messageId: Message) => {
+    pendingRequests.delete(messageId)
+  }
+
   return {
     interceptRequest,
     interceptResponse,
+    forgetRequest,
   }
 }
 
@@ -150,6 +167,11 @@ export function mcpProxy({
   let transportToClientClosed = false
   let transportToServerClosed = false
 
+  /** Answers a client request that will never get a real response. */
+  const failClientRequest = (messageId: Message, message: string) => {
+    transportToClient.send({ jsonrpc: '2.0' as const, id: messageId, error: { code: -32603, message } }).catch(onClientError)
+  }
+
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
       // Block tools/call for ignored tools
@@ -157,15 +179,7 @@ export function mcpProxy({
         const toolName = request.params.name
         if (!shouldIncludeTool(ignoredTools, toolName)) {
           // Send error response back to client immediately
-          const errorResponse = {
-            jsonrpc: '2.0' as const,
-            id: request.id,
-            error: {
-              code: -32603,
-              message: `Tool "${toolName}" is not available`,
-            },
-          }
-          transportToClient.send(errorResponse).catch(onClientError)
+          failClientRequest(request.id, `Tool "${toolName}" is not available`)
           // Return symbol to indicate this request should not be forwarded
           return MESSAGE_BLOCKED
         }
@@ -226,7 +240,19 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
-    transportToServer.send(message).catch(onServerError)
+    transportToServer.send(message).catch((error) => {
+      onServerError(error)
+
+      // A rejected send leaves the client waiting on a response that will never arrive -
+      // an OAuth error escaping the SDK's auth retry surfaces exactly this way, and the
+      // request hangs until the client's own timeout. Fail it fast instead. Notifications
+      // carry no id, so there is nothing to answer. The mirrored server-to-client forward
+      // below deliberately has no equivalent: answering it would mean synthesizing an
+      // error toward the remote server, which is a separate call to make.
+      if (message.id === undefined || message.id === null) return
+      messageTransformer.forgetRequest(message.id)
+      failClientRequest(message.id, `Failed to forward request to remote server: ${error instanceof Error ? error.message : String(error)}`)
+    })
   }
 
   transportToServer.onmessage = (_message) => {
@@ -415,7 +441,7 @@ export type AuthInitializer = () => Promise<{
 export async function connectToRemoteServer(
   client: Client | null,
   serverUrl: string,
-  authProvider: OAuthClientProvider,
+  authProvider: OAuthClientProvider & Partial<TransportFetchProvider>,
   headers: Record<string, string>,
   authInitializer: AuthInitializer,
   transportStrategy: TransportStrategy = 'http-first',
@@ -443,6 +469,10 @@ export async function connectToRemoteServer(
     },
   }
 
+  // The SDK threads this all the way into its OAuth token requests. NodeOAuthClientProvider
+  // supplies one that serializes refresh grants within this process.
+  const transportFetch = authProvider.transportFetch
+
   log(`Using transport strategy: ${transportStrategy}`)
   // Determine if we should attempt to fallback on error
   // Choose transport based on user strategy and recursion history
@@ -455,10 +485,12 @@ export async function connectToRemoteServer(
         authProvider,
         requestInit: { headers },
         eventSourceInit,
+        fetch: transportFetch,
       })
     : new StreamableHTTPClientTransport(url, {
         authProvider,
         requestInit: { headers },
+        fetch: transportFetch,
       })
 
   try {
@@ -477,7 +509,7 @@ export async function connectToRemoteServer(
         // On failure (401), copy `_resourceMetadataUrl` from the throwaway to the main
         // transport so `finishAuth` below can use the per-server PRM URL captured from
         // the WWW-Authenticate header (geelen/mcp-remote#231).
-        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
+        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers }, fetch: transportFetch })
         const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
         try {
           await testClient.connect(testTransport)
@@ -502,6 +534,24 @@ export async function connectToRemoteServer(
 
     return transport
   } catch (error: any) {
+    // Each recovery branch below reconnects at most once per reason. Bail out if this one
+    // has already been tried, so a persistent failure surfaces instead of looping.
+    const giveUpIfAlreadyTried = (reason: string) => {
+      if (!recursionReasons.has(reason)) return
+      const errorMessage = `Already attempted reconnection for reason: ${reason}. Giving up.`
+      log(errorMessage)
+      throw new Error(errorMessage)
+    }
+
+    // Close the failed transport before recursing so the recursive call's fresh transport
+    // doesn't share state with this one (Client) and so the AbortController / EventSource
+    // opened by the initial start() isn't leaked (proxy path, client=null). For the client
+    // path, SSE transports specifically throw UnauthorizedError from start() before
+    // Client.connect's initialize try/catch can run `void this.close()`, which would
+    // otherwise leave the failed transport attached and the recursive
+    // `client.connect(newTransport)` would hit "Already connected".
+    const closeFailedTransport = () => (client ? client.close() : transport.close())
+
     // Check if it's a protocol error and we should attempt fallback
     // StreamableHTTPError has a `code` property with the HTTP status code
     const isStreamableHTTPError = error instanceof StreamableHTTPError
@@ -519,12 +569,7 @@ export async function connectToRemoteServer(
     if (shouldFallbackOnError) {
       log(`Received error (status ${httpStatusCode ?? 'unknown'}): ${error.message}`)
 
-      // If we've already tried falling back once, throw an error
-      if (recursionReasons.has(REASON_TRANSPORT_FALLBACK)) {
-        const errorMessage = `Already attempted transport fallback. Giving up.`
-        log(errorMessage)
-        throw new Error(errorMessage)
-      }
+      giveUpIfAlreadyTried(REASON_TRANSPORT_FALLBACK)
 
       log(`Recursively reconnecting for reason: ${REASON_TRANSPORT_FALLBACK}`)
 
@@ -541,6 +586,21 @@ export async function connectToRemoteServer(
         sseTransport ? 'http-only' : 'sse-only',
         recursionReasons,
       )
+    } else if (error instanceof InvalidGrantError) {
+      // Lost the refresh-token rotation race twice: the SDK retries once after invalid_grant
+      // and then lets the error escape. tokens.json now holds whichever process survived, so
+      // rereading it on reconnect is enough - see invalidateTokens in the OAuth provider for
+      // why the credential is still live. Only reached before the connection is up; the same
+      // error afterwards surfaces through mcpProxy's failed-forward handling instead.
+      giveUpIfAlreadyTried(REASON_TOKENS_ROTATED)
+
+      log('Refresh token was rotated by a concurrent process. Reconnecting with the current tokens...')
+      debugLog('Reconnecting after invalid_grant escaped the SDK auth retry', { errorMessage: error.message })
+
+      await closeFailedTransport()
+
+      recursionReasons.add(REASON_TOKENS_ROTATED)
+      return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
       log('Authentication required. Initializing auth...')
       debugLog('Authentication error detected', {
@@ -569,27 +629,9 @@ export async function connectToRemoteServer(
         await transport.finishAuth(code)
         debugLog('Authorization completed successfully')
 
-        if (recursionReasons.has(REASON_AUTH_NEEDED)) {
-          const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
-          log(errorMessage)
-          debugLog('Already attempted auth reconnection, giving up', {
-            recursionReasons: Array.from(recursionReasons),
-          })
-          throw new Error(errorMessage)
-        }
+        giveUpIfAlreadyTried(REASON_AUTH_NEEDED)
 
-        // Close the failed transport before recursing so the recursive call's fresh
-        // transport doesn't share state with this one (Client) and so the AbortController
-        // / EventSource opened by the initial start() isn't leaked (proxy path, client=null).
-        // For the client path, SSE transports specifically throw UnauthorizedError from
-        // start() before Client.connect's initialize try/catch can run `void this.close()`,
-        // which would otherwise leave the failed transport attached and the recursive
-        // `client.connect(newTransport)` would hit "Already connected".
-        if (client) {
-          await client.close()
-        } else {
-          await transport.close()
-        }
+        await closeFailedTransport()
 
         recursionReasons.add(REASON_AUTH_NEEDED)
         log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)
@@ -781,6 +823,30 @@ export async function findAvailablePort(preferredPort?: number): Promise<number>
 }
 
 /**
+ * Routes global fetch through npm undici so a dispatcher set via setGlobalDispatcher
+ * (npm undici) is guaranteed to apply to SDK transports calling global.fetch, even on
+ * Node versions whose built-in fetch uses a separate undici instance.
+ *
+ * The companion classes must be aliased together with fetch: the SDK's OAuth error
+ * handling checks `response instanceof Response` against the global Response, and a
+ * response produced by npm undici's fetch fails that check against Node's built-in
+ * Response class. That mismatch turned every OAuth error response (e.g. invalid_grant
+ * during refresh-token rotation) into an unparseable ServerError ("Raw body: [object
+ * Response]"), which the SDK's auth flow silently swallows before falling back to a
+ * full browser re-authorization.
+ *
+ * Only these four move. FormData/Blob/File are left on Node's built-ins because nothing
+ * in the OAuth or transport path constructs them - token requests are URLSearchParams -
+ * so aliasing them would widen the blast radius for no benefit.
+ */
+function installUndiciGlobals() {
+  global.fetch = fetch as unknown as typeof global.fetch
+  global.Headers = Headers as unknown as typeof global.Headers
+  global.Request = Request as unknown as typeof global.Request
+  global.Response = Response as unknown as typeof global.Response
+}
+
+/**
  * Parses command line arguments for MCP clients and proxies
  * @param args Command line arguments
  * @param usage Usage message to show on error
@@ -844,9 +910,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   if (enableProxy) {
     // Use env proxy
     setGlobalDispatcher(new EnvHttpProxyAgent())
-    // On Node 22+, global.fetch uses Node's built-in undici, a separate instance from npm undici.
-    // Alias it so setGlobalDispatcher (npm undici) applies to SDK transports calling global.fetch.
-    global.fetch = fetch as unknown as typeof global.fetch
+    installUndiciGlobals()
     log('HTTP proxy support enabled - using system HTTP_PROXY/HTTPS_PROXY environment variables')
   }
 
@@ -855,9 +919,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     try {
       const dispatcher = createSocksDispatcher(socksUrl)
       setGlobalDispatcher(dispatcher)
-      // On Node 22+, global.fetch uses Node's built-in undici, a separate instance from npm undici.
-      // Alias it so setGlobalDispatcher (npm undici) applies to SDK transports calling global.fetch.
-      global.fetch = fetch as unknown as typeof global.fetch
+      installUndiciGlobals()
       log(`SOCKS proxy enabled: ${redactProxyUrl(socksUrl)}`)
     } catch (err) {
       log(`Error: Invalid --socks-proxy URL: ${err instanceof Error ? err.message : String(err)}`)

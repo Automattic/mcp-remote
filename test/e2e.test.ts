@@ -12,13 +12,16 @@ describe('MCP Remote E2E', () => {
     }
   })
 
+  // These servers are third-party and their tool inventories change; assert only on the
+  // handful of tools that have been stable, and let the shape checks below carry the rest.
+  // Pinning a full inventory here breaks this suite for reasons that have nothing to do
+  // with the proxy - `model_search` and `dataset_search` disappeared into `hub_repo_search`.
   it('connects to Hugging Face MCP server', async () => {
     client = await createMCPClient('https://huggingface.co/mcp')
     const tools = await listTools(client.client)
     const toolNames = tools.map((t) => t.name)
     expect(toolNames).toContain('hf_whoami')
-    expect(toolNames).toContain('model_search')
-    expect(toolNames).toContain('dataset_search')
+    expect(toolNames.length).toBeGreaterThan(1)
   }, 30000)
 
   it('connects to Cloudflare docs MCP server', async () => {

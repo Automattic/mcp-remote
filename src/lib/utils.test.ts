@@ -17,11 +17,18 @@ import path from 'path'
 // All sanitizeUrl tests have been moved to the strict-url-sanitise package
 
 describe('Feature: Command Line Arguments Parsing', () => {
-  // parseCommandLineArgs mutates global.fetch when --socks-proxy or --enable-proxy is passed.
-  // Snapshot once and restore after every test so the alias can't leak into later tests.
+  // parseCommandLineArgs mutates global fetch/Headers/Request/Response when --socks-proxy
+  // or --enable-proxy is passed. Snapshot once and restore after every test so the aliases
+  // can't leak into later tests.
   const originalGlobalFetch = global.fetch
+  const originalGlobalHeaders = global.Headers
+  const originalGlobalRequest = global.Request
+  const originalGlobalResponse = global.Response
   afterEach(() => {
     global.fetch = originalGlobalFetch
+    global.Headers = originalGlobalHeaders
+    global.Request = originalGlobalRequest
+    global.Response = originalGlobalResponse
   })
 
   it('Scenario: Parse basic server URL', async () => {
@@ -518,38 +525,42 @@ describe('Feature: Command Line Arguments Parsing', () => {
     }
   })
 
-  it('Scenario: --socks-proxy aliases global.fetch to npm undici fetch', async () => {
+  // Global restore for these two tests is handled by the describe-level afterEach above.
+  // See installUndiciGlobals in utils.ts for why all four globals move together.
+  it('Scenario: --socks-proxy aliases global fetch and companion classes to npm undici', async () => {
     const undici = await import('undici')
     const { getGlobalDispatcher, setGlobalDispatcher } = undici
     const originalDispatcher = getGlobalDispatcher()
-    const originalFetch = global.fetch
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const args = ['https://example.com/sse', '--socks-proxy', 'socks5://127.0.0.1:1080']
       await parseCommandLineArgs(args, 'test usage')
 
       expect(global.fetch).toBe(undici.fetch)
+      expect(global.Headers).toBe(undici.Headers)
+      expect(global.Request).toBe(undici.Request)
+      expect(global.Response).toBe(undici.Response)
     } finally {
       setGlobalDispatcher(originalDispatcher)
-      global.fetch = originalFetch
       consoleSpy.mockRestore()
     }
   })
 
-  it('Scenario: --enable-proxy aliases global.fetch to npm undici fetch', async () => {
+  it('Scenario: --enable-proxy aliases global fetch and companion classes to npm undici', async () => {
     const undici = await import('undici')
     const { getGlobalDispatcher, setGlobalDispatcher } = undici
     const originalDispatcher = getGlobalDispatcher()
-    const originalFetch = global.fetch
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const args = ['https://example.com/sse', '--enable-proxy']
       await parseCommandLineArgs(args, 'test usage')
 
       expect(global.fetch).toBe(undici.fetch)
+      expect(global.Headers).toBe(undici.Headers)
+      expect(global.Request).toBe(undici.Request)
+      expect(global.Response).toBe(undici.Response)
     } finally {
       setGlobalDispatcher(originalDispatcher)
-      global.fetch = originalFetch
       consoleSpy.mockRestore()
     }
   })
@@ -618,9 +629,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       try {
-        await expect(
-          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage'),
-        ).rejects.toThrow('process.exit')
+        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file', missingPath], 'test usage')).rejects.toThrow(
+          'process.exit',
+        )
         expect(exitSpy).toHaveBeenCalledWith(1)
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining(`could not be read`))
       } finally {
@@ -652,9 +663,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       try {
-        await expect(
-          parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage'),
-        ).rejects.toThrow('process.exit')
+        await expect(parseCommandLineArgs(['https://example.com/sse', '--instructions-file', '--debug'], 'test usage')).rejects.toThrow(
+          'process.exit',
+        )
         expect(exitSpy).toHaveBeenCalledWith(1)
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('--instructions-file requires a path argument'))
       } finally {
@@ -809,6 +820,81 @@ describe('Feature: MCP Proxy', () => {
         }),
       }),
     )
+  })
+
+  it('Scenario: A failed forward to the server answers the client instead of hanging', async () => {
+    // An OAuth error escaping the SDK's auth retry rejects the send. Without an answer the
+    // client waits on a response that will never come, until its own timeout fires.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(new Error('The provided authorization grant is invalid')),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    mockTransportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: '7' } as any)
+    await vi.waitFor(() => expect(mockTransportToClient.send).toHaveBeenCalled())
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jsonrpc: '2.0',
+        id: '7',
+        error: expect.objectContaining({
+          code: -32603,
+          message: expect.stringContaining('The provided authorization grant is invalid'),
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: A failed forward of a notification does not fabricate a response', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(new Error('boom')),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    // Notifications carry no id, so there is nothing to answer.
+    mockTransportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/initialized' } as any)
+    // Wait on the forward actually being attempted and rejecting, rather than on a timer.
+    await vi.waitFor(() => expect(mockTransportToServer.send).toHaveBeenCalled())
+
+    expect(mockTransportToClient.send).not.toHaveBeenCalled()
   })
 
   it('Scenario: Proxy server response back to client', async () => {

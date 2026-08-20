@@ -1,6 +1,7 @@
 import path from 'path'
 import os from 'os'
 import fs from 'fs/promises'
+import { randomBytes } from 'crypto'
 import { log, MCP_REMOTE_VERSION } from './utils'
 
 /**
@@ -112,6 +113,30 @@ export function getConfigFilePath(serverUrlHash: string, filename: string): stri
 }
 
 /**
+ * Writes a file by staging it under a unique temporary name in the same directory and
+ * renaming it into place.
+ *
+ * Several mcp-remote processes share these files, so a plain write is observable in its
+ * torn state: a reader can catch tokens.json mid-truncation, and readJsonFile reports a
+ * JSON parse failure as `undefined` - indistinguishable from "no tokens saved". The
+ * rename is atomic, so readers only ever see the previous or the next complete file.
+ *
+ * @param filePath The final path to write
+ * @param contents The file contents
+ */
+async function writeFileAtomic(filePath: string, contents: string): Promise<void> {
+  const tempPath = `${filePath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
+  try {
+    // The mode is set on the staged file so the rename carries it over to the final one.
+    await fs.writeFile(tempPath, contents, { encoding: 'utf-8', mode: 0o600 })
+    await fs.rename(tempPath, filePath)
+  } catch (error) {
+    await fs.unlink(tempPath).catch(() => {})
+    throw error
+  }
+}
+
+/**
  * Deletes a config file if it exists
  * @param serverUrlHash The hash of the server URL
  * @param filename The name of the file to delete
@@ -164,7 +189,7 @@ export async function writeJsonFile(serverUrlHash: string, filename: string, dat
   try {
     await ensureConfigDir()
     const filePath = getConfigFilePath(serverUrlHash, filename)
-    await fs.writeFile(filePath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 })
+    await writeFileAtomic(filePath, JSON.stringify(data, null, 2))
   } catch (error) {
     log(`Error writing ${filename}:`, error)
     throw error
@@ -198,7 +223,7 @@ export async function writeTextFile(serverUrlHash: string, filename: string, tex
   try {
     await ensureConfigDir()
     const filePath = getConfigFilePath(serverUrlHash, filename)
-    await fs.writeFile(filePath, text, { encoding: 'utf-8', mode: 0o600 })
+    await writeFileAtomic(filePath, text)
   } catch (error) {
     log(`Error writing ${filename}:`, error)
     throw error
