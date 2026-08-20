@@ -9,7 +9,7 @@ import {
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
 import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
-import { log, debugLog, DEBUG, MCP_REMOTE_VERSION } from './utils'
+import { log, debugLog, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
@@ -192,44 +192,36 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    */
   async tokens(): Promise<OAuthTokens | undefined> {
     debugLog('Reading OAuth tokens')
-    if (DEBUG) {
-      // Only capture the stack when debugging: tokens() is on the SDK's request hot
-      // path and new Error().stack is evaluated before debugLog can discard it.
-      debugLog('Token request stack trace:', new Error().stack)
-    }
+    // Thunked: this is the SDK's per-request hot path, so nothing here should be built
+    // unless debug logging is actually on.
+    debugLog('Token request stack trace:', () => new Error().stack)
 
     const tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
-    // Pin the first refresh token we see and hold it until an invalidation resolves.
-    // tokens() is the SDK's per-request hot path and every in-flight auth flow in this
-    // process shares this provider, so a later read - quite possibly of another process's
-    // freshly rotated token - must not overwrite what our own pending refresh is using.
-    // Without the pin, invalidateCredentials mistakes their live token for ours and
-    // deletes it.
+    // Pin the first refresh token we see. A later read may return another process's freshly
+    // rotated token, and letting it overwrite the pin would make invalidateCredentials
+    // mistake their live credential for ours and delete it.
     this._pinnedRefreshToken ??= tokens?.refresh_token
 
     if (tokens) {
       const timeLeft = tokens.expires_in || 0
 
-      // Alert if expires_in is invalid. Gated on DEBUG for the same reason as the stack
-      // above: a server that omits expires_in makes this branch true on every hot-path
-      // read, and the argument object - stack capture included - is built before
-      // debugLog can discard it.
-      if (DEBUG && (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0)) {
-        debugLog('⚠️ WARNING: Invalid expires_in detected while reading tokens ⚠️', {
+      // Alert if expires_in is invalid
+      if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
+        debugLog('⚠️ WARNING: Invalid expires_in detected while reading tokens ⚠️', () => ({
           expiresIn: tokens.expires_in,
-          tokenObject: JSON.stringify(tokens),
+          tokenObject: tokens,
           stack: new Error('Invalid expires_in value').stack,
-        })
+        }))
       }
 
-      debugLog('Token result:', {
+      debugLog('Token result:', () => ({
         found: true,
         hasAccessToken: !!tokens.access_token,
         hasRefreshToken: !!tokens.refresh_token,
         expiresIn: `${timeLeft} seconds`,
         isExpired: timeLeft <= 0,
         expiresInValue: tokens.expires_in,
-      })
+      }))
     } else {
       debugLog('Token result: Not found')
     }
@@ -246,24 +238,23 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     // Alert if expires_in is invalid
     if (typeof tokens.expires_in !== 'number' || tokens.expires_in < 0) {
-      debugLog('⚠️ WARNING: Invalid expires_in detected in tokens ⚠️', {
+      debugLog('⚠️ WARNING: Invalid expires_in detected in tokens ⚠️', () => ({
         expiresIn: tokens.expires_in,
-        tokenObject: JSON.stringify(tokens),
+        tokenObject: tokens,
         stack: new Error('Invalid expires_in value').stack,
-      })
+      }))
     }
 
-    debugLog('Saving tokens', {
+    debugLog('Saving tokens', () => ({
       hasAccessToken: !!tokens.access_token,
       hasRefreshToken: !!tokens.refresh_token,
       expiresIn: `${timeLeft} seconds`,
       expiresInValue: tokens.expires_in,
-    })
+    }))
 
-    // Deliberately leaves _pinnedRefreshToken alone. A concurrent auth flow in this same
-    // process may be mid-refresh with the token it pinned; touching the pin here - setting
-    // it to ours or clearing it - is what would make that flow's invalidation delete the
-    // pair we just wrote. Only invalidateCredentials retires the pin.
+    // Deliberately leaves _pinnedRefreshToken alone: a concurrent flow may be mid-refresh
+    // with the token it pinned, and retiring it here would make that flow's invalidation
+    // delete the pair we just wrote. Only invalidateTokens retires the pin.
     await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
   }
 
@@ -365,51 +356,39 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * while holding the stale token. The winner's fresh pair is already on disk, so keep it -
    * the SDK re-runs its auth flow right after this call and picks it up, instead of
    * deleting a live credential and forcing a browser re-auth.
-   */
-  private async invalidateTokens(): Promise<void> {
-    try {
-      if (await this.tokensWereRotatedByAnotherProcess()) {
-        log('Stored tokens were rotated by a concurrent process - keeping the newer tokens and retrying with them')
-        return
-      }
-      await deleteConfigFile(this.serverUrlHash, 'tokens.json')
-      debugLog('OAuth tokens invalidated')
-    } finally {
-      // Retire the pin on both branches. The next attempt re-pins from disk, which is what
-      // bounds a wrong decision here to a single auth cycle: if we just kept tokens we
-      // should have deleted (our own grant really is dead, and the pin was stale because
-      // another process had rotated since we pinned), the following attempt pins the
-      // current token, matches it, deletes, and falls through to browser auth. Leaving a
-      // stale pin in place instead would keep the dead pair forever.
-      this._pinnedRefreshToken = undefined
-    }
-  }
-
-  /**
-   * Reports whether the tokens on disk carry a different refresh token than the one this
-   * process pinned for the refresh attempt that just failed. If so, someone else rotated
-   * them after we pinned ours, and the on-disk pair is the live one.
    *
    * This is a heuristic, not mutual exclusion, and the remaining gaps are deliberate:
    *
+   * - The pin is per-provider, not per-refresh-attempt. The SDK exposes no attempt handle,
+   *   so the two coincide only while at most one refresh is in flight.
    * - Refreshes are not serialized across processes. N processes waking together still
    *   produce N rotations per expiry event; this only keeps that from being fatal.
-   * - The read here and the delete in invalidateTokens are not atomic, so a writer landing
-   *   between them still loses its fresh pair. Config writes are atomic (see
-   *   writeFileAtomic), which removes torn reads as a cause, but not this window.
-   * - A refresh that fails for any reason other than invalid_grant never reaches this code,
-   *   so the pin survives a network blip and goes stale.
+   * - The read below and the delete are not atomic, so a writer landing between them still
+   *   loses its fresh pair. Atomic config writes remove torn reads as a cause of that, but
+   *   not the window itself.
+   * - A refresh failing for any reason other than invalid_grant never reaches this code, so
+   *   the pin survives a network blip and goes stale.
    *
-   * Every one of those costs at most one browser re-auth, which is the behavior we already
-   * tolerate. Closing them properly means observing the refresh request itself - the SDK
-   * threads a `fetch` from the transport all the way into its token POST - and serializing
-   * on it, which is a larger change than this guard.
+   * Each of those costs at most one browser re-auth, the behavior we already tolerate.
+   * Closing them properly means observing the refresh request itself - the SDK threads a
+   * `fetch` from the transport into its token POST - and serializing on that.
    */
-  private async tokensWereRotatedByAnotherProcess(): Promise<boolean> {
-    if (!this._pinnedRefreshToken) {
-      return false
+  private async invalidateTokens(): Promise<void> {
+    // Retire the pin up front, so it happens on every path out of here. The next attempt
+    // re-pins from disk, which is what bounds a wrong decision below to a single auth
+    // cycle: if we keep tokens we should have deleted, the following attempt pins the
+    // current token, matches it, deletes, and reaches browser auth. A pin left in place
+    // would keep a dead pair forever.
+    const pinned = this._pinnedRefreshToken
+    this._pinnedRefreshToken = undefined
+
+    const onDisk = pinned ? await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema) : undefined
+    if (onDisk?.refresh_token && onDisk.refresh_token !== pinned) {
+      log('Stored tokens were rotated by a concurrent process - keeping the newer tokens and retrying with them')
+      return
     }
-    const onDisk = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
-    return !!onDisk?.refresh_token && onDisk.refresh_token !== this._pinnedRefreshToken
+
+    await deleteConfigFile(this.serverUrlHash, 'tokens.json')
+    debugLog('OAuth tokens invalidated')
   }
 }

@@ -2,9 +2,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import express from 'express'
 import type { Server } from 'http'
 import type { AddressInfo } from 'net'
-import * as os from 'os'
-import * as path from 'path'
-import * as fs from 'fs/promises'
 import { randomBytes } from 'crypto'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -12,6 +9,7 @@ import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
 import { connectToRemoteServer } from './utils'
 import { writeJsonFile } from './mcp-auth-config'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
+import { useTempConfigDir } from './test-support'
 import type { OAuthProviderOptions } from './types'
 
 // Stands up a real express server on an ephemeral port and lets each test register handlers.
@@ -55,50 +53,52 @@ class MockServer {
 describe('Feature: OAuth flow end-to-end', () => {
   let mcp: MockServer
   let idp: MockServer
-  let tmpConfigDir: string
-  let originalConfigDirEnv: string | undefined
+
+  useTempConfigDir()
 
   beforeEach(async () => {
     mcp = new MockServer()
     idp = new MockServer()
     await mcp.start()
     await idp.start()
-
-    tmpConfigDir = path.join(os.tmpdir(), `mcp-remote-test-${randomBytes(6).toString('hex')}`)
-    await fs.mkdir(tmpConfigDir, { recursive: true })
-    originalConfigDirEnv = process.env.MCP_REMOTE_CONFIG_DIR
-    process.env.MCP_REMOTE_CONFIG_DIR = tmpConfigDir
   })
 
   afterEach(async () => {
     await mcp.stop()
     await idp.stop()
-    if (originalConfigDirEnv === undefined) {
-      delete process.env.MCP_REMOTE_CONFIG_DIR
-    } else {
-      process.env.MCP_REMOTE_CONFIG_DIR = originalConfigDirEnv
-    }
-    await fs.rm(tmpConfigDir, { recursive: true, force: true })
   })
 
-  it('Scenario: completes auth, reconnects with fresh transport, and serves a tools/list request', async () => {
-    const mcpServerUrl = mcp.url('/mcp')
-    const resourceMetadataUrl = mcp.url('/per-server/oauth-protected-resource')
-    const accessToken = 'test-access-token-' + randomBytes(4).toString('hex')
+  /** Minimal RFC 8414 metadata, mounted at the root so the SDK's well-known discovery finds it. */
+  const serveIdpMetadata = () => {
+    idp.on('GET', '/.well-known/oauth-authorization-server', (_req, res) => {
+      res.json({
+        issuer: idp.baseUrl,
+        authorization_endpoint: idp.url('/authorize'),
+        token_endpoint: idp.url('/token'),
+        response_types_supported: ['code'],
+        code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: ['none'],
+      })
+    })
+  }
 
-    // mcp server: 401 with WWW-Authenticate → after auth, real initialize + tools/list responses.
-    let unauthenticatedPosts = 0
+  /**
+   * An MCP endpoint that 401s without the expected bearer token and otherwise answers
+   * initialize and tools/list. `onUnauthenticated` observes rejected requests.
+   */
+  const serveMcp = ({ accessToken, onUnauthenticated }: { accessToken: string; onUnauthenticated?: () => void }) => {
+    const resourceMetadataUrl = mcp.url('/per-server/oauth-protected-resource')
+
     mcp.on('POST', '/mcp', (req, res) => {
       const authHeader = req.headers.authorization
-      if (!authHeader) unauthenticatedPosts += 1
-      if (!authHeader) {
+      // A missing token and a stale one both get 401 + WWW-Authenticate, as a real resource
+      // server does - that header is what starts the SDK's auth flow.
+      if (authHeader !== `Bearer ${accessToken}`) {
+        if (!authHeader) onUnauthenticated?.()
         return res
           .status(401)
           .header('WWW-Authenticate', `Bearer realm="mcp", resource_metadata="${resourceMetadataUrl}"`)
           .json({ error: 'Unauthorized' })
-      }
-      if (authHeader !== `Bearer ${accessToken}`) {
-        return res.status(403).json({ error: 'Forbidden' })
       }
       const body = req.body
       const respond = (result: unknown) => res.header('content-type', 'application/json').json({ jsonrpc: '2.0', id: body.id, result })
@@ -120,24 +120,43 @@ describe('Feature: OAuth flow end-to-end', () => {
     // intentionally do NOT serve the bare /.well-known/oauth-protected-resource path so
     // that any code that drops the per-server URL falls back to a 404 and fails.
     mcp.on('GET', '/per-server/oauth-protected-resource', (_req, res) => {
-      res.json({
-        resource: mcpServerUrl,
-        authorization_servers: [idp.baseUrl],
-      })
+      res.json({ resource: mcp.url('/mcp'), authorization_servers: [idp.baseUrl] })
     })
+  }
 
-    // idp server: minimal RFC 8414 metadata + token endpoint. Mounted at root so the SDK's
-    // well-known discovery (which uses the issuer's origin) finds the metadata on the first try.
-    idp.on('GET', '/.well-known/oauth-authorization-server', (_req, res) => {
-      res.json({
-        issuer: idp.baseUrl,
-        authorization_endpoint: idp.url('/authorize'),
-        token_endpoint: idp.url('/token'),
-        response_types_supported: ['code'],
-        code_challenge_methods_supported: ['S256'],
-        token_endpoint_auth_methods_supported: ['none'],
-      })
+  const makeProvider = ({
+    serverUrlHash,
+    callbackPort,
+    grantTypes = ['authorization_code'],
+  }: {
+    serverUrlHash: string
+    callbackPort: number
+    grantTypes?: string[]
+  }) => {
+    const callbackPath = '/oauth/callback'
+    return new NodeOAuthClientProvider(<OAuthProviderOptions>{
+      serverUrl: mcp.url('/mcp'),
+      serverUrlHash,
+      callbackPort,
+      host: 'localhost',
+      callbackPath,
+      staticOAuthClientInfo: {
+        client_id: 'test-client-id',
+        redirect_uris: [`http://localhost:${callbackPort}${callbackPath}`],
+        token_endpoint_auth_method: 'none',
+        grant_types: grantTypes,
+        response_types: ['code'],
+      },
     })
+  }
+
+  it('Scenario: completes auth, reconnects with fresh transport, and serves a tools/list request', async () => {
+    const mcpServerUrl = mcp.url('/mcp')
+    const accessToken = 'test-access-token-' + randomBytes(4).toString('hex')
+
+    let unauthenticatedPosts = 0
+    serveMcp({ accessToken, onUnauthenticated: () => (unauthenticatedPosts += 1) })
+    serveIdpMetadata()
     idp.on('POST', '/token', (req, res) => {
       // Validate redirect_uri matches what was registered — otherwise the test would silently
       // pass even if NodeOAuthClientProvider.redirectUrl diverged from the static redirect_uris.
@@ -148,22 +167,8 @@ describe('Feature: OAuth flow end-to-end', () => {
     })
 
     const callbackPort = 33418
-    const callbackPath = '/oauth/callback'
-    const redirectUri = `http://localhost:${callbackPort}${callbackPath}`
-    const authProvider = new NodeOAuthClientProvider(<OAuthProviderOptions>{
-      serverUrl: mcpServerUrl,
-      serverUrlHash: 'oauth-flow-test',
-      callbackPort,
-      host: 'localhost',
-      callbackPath,
-      staticOAuthClientInfo: {
-        client_id: 'test-client-id',
-        redirect_uris: [redirectUri],
-        token_endpoint_auth_method: 'none',
-        grant_types: ['authorization_code'],
-        response_types: ['code'],
-      },
-    })
+    const redirectUri = `http://localhost:${callbackPort}/oauth/callback`
+    const authProvider = makeProvider({ serverUrlHash: 'oauth-flow-test', callbackPort })
     vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
 
     const authInitializer = vi.fn().mockResolvedValue({
@@ -195,7 +200,6 @@ describe('Feature: OAuth flow end-to-end', () => {
     // surviving process's tokens rather than dying or opening a browser.
     const serverUrlHash = 'rotation-race-test'
     const mcpServerUrl = mcp.url('/mcp')
-    const resourceMetadataUrl = mcp.url('/per-server/oauth-protected-resource')
     const goodAccessToken = 'access-after-recovery'
 
     await writeJsonFile(serverUrlHash, 'tokens.json', {
@@ -205,42 +209,8 @@ describe('Feature: OAuth flow end-to-end', () => {
       refresh_token: 'refresh-1',
     })
 
-    mcp.on('POST', '/mcp', (req, res) => {
-      if (req.headers.authorization !== `Bearer ${goodAccessToken}`) {
-        return res
-          .status(401)
-          .header('WWW-Authenticate', `Bearer realm="mcp", resource_metadata="${resourceMetadataUrl}"`)
-          .json({ error: 'Unauthorized' })
-      }
-      const body = req.body
-      const respond = (result: unknown) => res.header('content-type', 'application/json').json({ jsonrpc: '2.0', id: body.id, result })
-      if (body.method === 'initialize') {
-        return respond({
-          protocolVersion: '2025-06-18',
-          capabilities: { tools: {} },
-          serverInfo: { name: 'mock-mcp', version: '0.0.0' },
-        })
-      }
-      if (body.method === 'tools/list') {
-        return respond({ tools: [{ name: 'echo', description: 'echoes input', inputSchema: { type: 'object' } }] })
-      }
-      return res.status(202).end()
-    })
-
-    mcp.on('GET', '/per-server/oauth-protected-resource', (_req, res) => {
-      res.json({ resource: mcpServerUrl, authorization_servers: [idp.baseUrl] })
-    })
-
-    idp.on('GET', '/.well-known/oauth-authorization-server', (_req, res) => {
-      res.json({
-        issuer: idp.baseUrl,
-        authorization_endpoint: idp.url('/authorize'),
-        token_endpoint: idp.url('/token'),
-        response_types_supported: ['code'],
-        code_challenge_methods_supported: ['S256'],
-        token_endpoint_auth_methods_supported: ['none'],
-      })
-    })
+    serveMcp({ accessToken: goodAccessToken })
+    serveIdpMetadata()
 
     // Single-use rotation. The first two presented tokens have already been spent by other
     // processes, which each left their rotated pair on disk before we got here.
@@ -261,21 +231,10 @@ describe('Feature: OAuth flow end-to-end', () => {
       res.json({ access_token: goodAccessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-4' })
     })
 
-    const callbackPort = 33420
-    const callbackPath = '/oauth/callback'
-    const authProvider = new NodeOAuthClientProvider(<OAuthProviderOptions>{
-      serverUrl: mcpServerUrl,
+    const authProvider = makeProvider({
       serverUrlHash,
-      callbackPort,
-      host: 'localhost',
-      callbackPath,
-      staticOAuthClientInfo: {
-        client_id: 'test-client-id',
-        redirect_uris: [`http://localhost:${callbackPort}${callbackPath}`],
-        token_endpoint_auth_method: 'none',
-        grant_types: ['authorization_code', 'refresh_token'],
-        response_types: ['code'],
-      },
+      callbackPort: 33420,
+      grantTypes: ['authorization_code', 'refresh_token'],
     })
     const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
     const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
@@ -333,20 +292,7 @@ describe('Feature: OAuth flow end-to-end', () => {
       return res.status(202).end()
     })
 
-    const authProvider = new NodeOAuthClientProvider(<OAuthProviderOptions>{
-      serverUrl: mcp.url('/mcp'),
-      serverUrlHash: 'proxy-session-leak-test',
-      callbackPort: 33419,
-      host: 'localhost',
-      callbackPath: '/oauth/callback',
-      staticOAuthClientInfo: {
-        client_id: 'noop-client-id',
-        redirect_uris: ['http://localhost:33419/oauth/callback'],
-        token_endpoint_auth_method: 'none',
-        grant_types: ['authorization_code'],
-        response_types: ['code'],
-      },
-    })
+    const authProvider = makeProvider({ serverUrlHash: 'proxy-session-leak-test', callbackPort: 33419 })
     const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
 
     // Proxy path: client === null.

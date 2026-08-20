@@ -891,7 +891,8 @@ describe('Feature: MCP Proxy', () => {
 
     // Notifications carry no id, so there is nothing to answer.
     mockTransportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/initialized' } as any)
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    // Wait on the forward actually being attempted and rejecting, rather than on a timer.
+    await vi.waitFor(() => expect(mockTransportToServer.send).toHaveBeenCalled())
 
     expect(mockTransportToClient.send).not.toHaveBeenCalled()
   })

@@ -1,37 +1,16 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import fs from 'fs/promises'
-import os from 'os'
-import path from 'path'
-import { randomBytes } from 'crypto'
+import { z } from 'zod'
 import { getConfigDir, readJsonFile, writeJsonFile, writeTextFile, getConfigFilePath } from './mcp-auth-config'
+import { useTempConfigDir } from './test-support'
 
-// Passthrough validator - these tests care about file integrity, not token shape.
-const anySchema = {
-  async parseAsync(data: any) {
-    return data
-  },
-}
+// These tests care about file integrity, not token shape.
+const anySchema = z.any()
 
 describe('Feature: Config File Writes', () => {
   const serverUrlHash = 'test-hash'
-  let tmpConfigDir: string
-  let originalConfigDirEnv: string | undefined
 
-  beforeEach(async () => {
-    tmpConfigDir = path.join(os.tmpdir(), `mcp-remote-test-${randomBytes(6).toString('hex')}`)
-    await fs.mkdir(tmpConfigDir, { recursive: true })
-    originalConfigDirEnv = process.env.MCP_REMOTE_CONFIG_DIR
-    process.env.MCP_REMOTE_CONFIG_DIR = tmpConfigDir
-  })
-
-  afterEach(async () => {
-    if (originalConfigDirEnv === undefined) {
-      delete process.env.MCP_REMOTE_CONFIG_DIR
-    } else {
-      process.env.MCP_REMOTE_CONFIG_DIR = originalConfigDirEnv
-    }
-    await fs.rm(tmpConfigDir, { recursive: true, force: true })
-  })
+  useTempConfigDir()
 
   it('Scenario: a reader never observes a partially written file', async () => {
     // Several mcp-remote processes share tokens.json. readJsonFile reports a JSON parse
@@ -57,7 +36,8 @@ describe('Feature: Config File Writes', () => {
 
     await Promise.all([...readers, writers])
 
-    expect(observed.length).toBeGreaterThan(0)
+    // Proves the readers actually ran, rather than the loop below vacuously passing.
+    expect(observed).toHaveLength(40 * 25)
     // Every read is one of the two complete payloads - never undefined (torn/absent) and
     // never a value that parsed but lost fields.
     for (const value of observed) {

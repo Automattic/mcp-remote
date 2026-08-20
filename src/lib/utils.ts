@@ -49,9 +49,18 @@ function getTimestamp(): string {
   return now.toISOString()
 }
 
-// Debug logging function
-export function debugLog(message: string, ...args: any[]) {
+/**
+ * Debug logging function.
+ *
+ * Arguments may be passed as thunks, which are only invoked once DEBUG is known to be on.
+ * Callers on hot paths should use that form: a plain argument is built by the caller before
+ * this function can discard it, so an eager `new Error().stack` or `JSON.stringify` costs
+ * its full price on every call even when debug logging is off.
+ */
+export function debugLog(message: string, ...args: Array<unknown | (() => unknown)>) {
   if (!DEBUG) return
+
+  args = args.map((arg) => (typeof arg === 'function' ? (arg as () => unknown)() : arg))
 
   const serverUrlHash = global.currentServerUrlHash
   if (!serverUrlHash) {
@@ -127,9 +136,16 @@ export function createMessageTransformer({
     return transformResponseFunction?.(originalRequest, message) ?? message
   }
 
+  // For requests that will never get a response - a forward that failed, say. The entry
+  // would otherwise sit in the map for the lifetime of the process.
+  const forgetRequest = (messageId: Message) => {
+    pendingRequests.delete(messageId)
+  }
+
   return {
     interceptRequest,
     interceptResponse,
+    forgetRequest,
   }
 }
 
@@ -151,6 +167,11 @@ export function mcpProxy({
   let transportToClientClosed = false
   let transportToServerClosed = false
 
+  /** Answers a client request that will never get a real response. */
+  const failClientRequest = (messageId: Message, message: string) => {
+    transportToClient.send({ jsonrpc: '2.0' as const, id: messageId, error: { code: -32603, message } }).catch(onClientError)
+  }
+
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
       // Block tools/call for ignored tools
@@ -158,15 +179,7 @@ export function mcpProxy({
         const toolName = request.params.name
         if (!shouldIncludeTool(ignoredTools, toolName)) {
           // Send error response back to client immediately
-          const errorResponse = {
-            jsonrpc: '2.0' as const,
-            id: request.id,
-            error: {
-              code: -32603,
-              message: `Tool "${toolName}" is not available`,
-            },
-          }
-          transportToClient.send(errorResponse).catch(onClientError)
+          failClientRequest(request.id, `Tool "${toolName}" is not available`)
           // Return symbol to indicate this request should not be forwarded
           return MESSAGE_BLOCKED
         }
@@ -232,18 +245,13 @@ export function mcpProxy({
 
       // A rejected send leaves the client waiting on a response that will never arrive -
       // an OAuth error escaping the SDK's auth retry surfaces exactly this way, and the
-      // request hangs until the client's own timeout. Fail it fast instead.
-      if (message.id !== undefined && message.id !== null) {
-        const errorResponse = {
-          jsonrpc: '2.0' as const,
-          id: message.id,
-          error: {
-            code: -32603,
-            message: `Failed to forward request to remote server: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        }
-        transportToClient.send(errorResponse).catch(onClientError)
-      }
+      // request hangs until the client's own timeout. Fail it fast instead. Notifications
+      // carry no id, so there is nothing to answer. The mirrored server-to-client forward
+      // below deliberately has no equivalent: answering it would mean synthesizing an
+      // error toward the remote server, which is a separate call to make.
+      if (message.id === undefined || message.id === null) return
+      messageTransformer.forgetRequest(message.id)
+      failClientRequest(message.id, `Failed to forward request to remote server: ${error instanceof Error ? error.message : String(error)}`)
     })
   }
 
@@ -520,6 +528,24 @@ export async function connectToRemoteServer(
 
     return transport
   } catch (error: any) {
+    // Each recovery branch below reconnects at most once per reason. Bail out if this one
+    // has already been tried, so a persistent failure surfaces instead of looping.
+    const giveUpIfAlreadyTried = (reason: string) => {
+      if (!recursionReasons.has(reason)) return
+      const errorMessage = `Already attempted reconnection for reason: ${reason}. Giving up.`
+      log(errorMessage)
+      throw new Error(errorMessage)
+    }
+
+    // Close the failed transport before recursing so the recursive call's fresh transport
+    // doesn't share state with this one (Client) and so the AbortController / EventSource
+    // opened by the initial start() isn't leaked (proxy path, client=null). For the client
+    // path, SSE transports specifically throw UnauthorizedError from start() before
+    // Client.connect's initialize try/catch can run `void this.close()`, which would
+    // otherwise leave the failed transport attached and the recursive
+    // `client.connect(newTransport)` would hit "Already connected".
+    const closeFailedTransport = () => (client ? client.close() : transport.close())
+
     // Check if it's a protocol error and we should attempt fallback
     // StreamableHTTPError has a `code` property with the HTTP status code
     const isStreamableHTTPError = error instanceof StreamableHTTPError
@@ -537,12 +563,7 @@ export async function connectToRemoteServer(
     if (shouldFallbackOnError) {
       log(`Received error (status ${httpStatusCode ?? 'unknown'}): ${error.message}`)
 
-      // If we've already tried falling back once, throw an error
-      if (recursionReasons.has(REASON_TRANSPORT_FALLBACK)) {
-        const errorMessage = `Already attempted transport fallback. Giving up.`
-        log(errorMessage)
-        throw new Error(errorMessage)
-      }
+      giveUpIfAlreadyTried(REASON_TRANSPORT_FALLBACK)
 
       log(`Recursively reconnecting for reason: ${REASON_TRANSPORT_FALLBACK}`)
 
@@ -560,26 +581,17 @@ export async function connectToRemoteServer(
         recursionReasons,
       )
     } else if (error instanceof InvalidGrantError) {
-      // The SDK retries a refresh exactly once after invalid_grant, so losing the rotation
-      // race twice in a row escapes auth() entirely and lands here. By now tokens.json holds
-      // whichever process survived, so one reconnect re-reads it and succeeds. If the grant
-      // really is dead, that retry re-pinned the provider from disk, so the next invalidation
-      // matches, deletes, and takes the normal browser-auth path.
-      if (recursionReasons.has(REASON_TOKENS_ROTATED)) {
-        const errorMessage = `Already attempted reconnection for reason: ${REASON_TOKENS_ROTATED}. Giving up.`
-        log(errorMessage)
-        throw new Error(errorMessage)
-      }
+      // Lost the refresh-token rotation race twice: the SDK retries once after invalid_grant
+      // and then lets the error escape. tokens.json now holds whichever process survived, so
+      // rereading it on reconnect is enough - see invalidateTokens in the OAuth provider for
+      // why the credential is still live. Only reached before the connection is up; the same
+      // error afterwards surfaces through mcpProxy's failed-forward handling instead.
+      giveUpIfAlreadyTried(REASON_TOKENS_ROTATED)
 
       log('Refresh token was rotated by a concurrent process. Reconnecting with the current tokens...')
       debugLog('Reconnecting after invalid_grant escaped the SDK auth retry', { errorMessage: error.message })
 
-      // Close the failed transport before recursing, for the same reasons as the auth path.
-      if (client) {
-        await client.close()
-      } else {
-        await transport.close()
-      }
+      await closeFailedTransport()
 
       recursionReasons.add(REASON_TOKENS_ROTATED)
       return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
@@ -611,27 +623,9 @@ export async function connectToRemoteServer(
         await transport.finishAuth(code)
         debugLog('Authorization completed successfully')
 
-        if (recursionReasons.has(REASON_AUTH_NEEDED)) {
-          const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
-          log(errorMessage)
-          debugLog('Already attempted auth reconnection, giving up', {
-            recursionReasons: Array.from(recursionReasons),
-          })
-          throw new Error(errorMessage)
-        }
+        giveUpIfAlreadyTried(REASON_AUTH_NEEDED)
 
-        // Close the failed transport before recursing so the recursive call's fresh
-        // transport doesn't share state with this one (Client) and so the AbortController
-        // / EventSource opened by the initial start() isn't leaked (proxy path, client=null).
-        // For the client path, SSE transports specifically throw UnauthorizedError from
-        // start() before Client.connect's initialize try/catch can run `void this.close()`,
-        // which would otherwise leave the failed transport attached and the recursive
-        // `client.connect(newTransport)` would hit "Already connected".
-        if (client) {
-          await client.close()
-        } else {
-          await transport.close()
-        }
+        await closeFailedTransport()
 
         recursionReasons.add(REASON_AUTH_NEEDED)
         log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)
