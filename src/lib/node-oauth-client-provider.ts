@@ -47,7 +47,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
   private _clientInfo: OAuthClientInformationFull | undefined
   private _pinnedRefreshToken: string | undefined
   private _refreshQueue: Promise<unknown> = Promise.resolve()
-  private _persistedIssuances = new Set<string>()
+  private _persistedIssuances = new Map<string, number>()
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
@@ -324,18 +324,43 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
    * would consume it and the save for the other would write a spent token over the newer
    * pair. Together they differ whenever the issuance differs.
    *
-   * Markers are one-shot, consumed by the matching save. The cap is a leak guard for an
-   * issuance whose save never arrives; refreshes are serialized by queueRefresh and each
-   * save follows its own refresh within microtasks, so the number outstanding at once stays
-   * far below it.
+   * Counted rather than a set, because a server may answer two refreshes with the identical
+   * pair. Collapsing those would leave one save unmatched, and it would write its pair over
+   * whatever a later issuance had since stored.
+   *
+   * Markers are consumed one per matching save and survive invalidation, so a save in flight
+   * for a pair that has since been deleted cannot write it back. The cap is a leak guard for
+   * an issuance whose save never arrives; refreshes are serialized by queueRefresh and each
+   * save follows its own refresh within microtasks, so the number outstanding stays far
+   * below it.
    */
   private rememberPersistedTokens(tokens: OAuthTokens): void {
     const markers = this._persistedIssuances
-    markers.add(issuanceKey(tokens))
-    const [oldest] = markers
-    if (markers.size > MAX_PERSISTED_TOKEN_MARKERS && oldest) {
+    const key = issuanceKey(tokens)
+    markers.set(key, (markers.get(key) ?? 0) + 1)
+
+    const [oldest] = markers.keys()
+    if (markers.size > MAX_PERSISTED_TOKEN_MARKERS && oldest !== undefined) {
       markers.delete(oldest)
     }
+  }
+
+  /**
+   * Takes one marker for `tokens` if this process has an unclaimed write of that exact pair,
+   * reporting whether it found one.
+   */
+  private consumePersistedMarker(tokens: OAuthTokens): boolean {
+    const key = issuanceKey(tokens)
+    const outstanding = this._persistedIssuances.get(key)
+    if (!outstanding) {
+      return false
+    }
+    if (outstanding === 1) {
+      this._persistedIssuances.delete(key)
+    } else {
+      this._persistedIssuances.set(key, outstanding - 1)
+    }
+    return true
   }
 
   /**
@@ -416,7 +441,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
     // the request actually spent. The SDK calls this afterwards, outside that queue, so a
     // refresh that has since rotated past this pair would otherwise be undone by it.
     // Consuming the marker keeps this to the one save that issuance belongs to.
-    if (this._persistedIssuances.delete(issuanceKey(tokens))) {
+    if (this.consumePersistedMarker(tokens)) {
       debugLog('Skipping saveTokens; the refresh that produced these tokens already stored them')
       return
     }
@@ -494,7 +519,6 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
         ])
         this._clientInfo = undefined
         this._pinnedRefreshToken = undefined
-        this._persistedIssuances.clear()
         debugLog('All credentials invalidated')
         break
 
@@ -566,8 +590,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
     }
 
     await deleteConfigFile(this.serverUrlHash, 'tokens.json')
-    // Nothing we wrote is on disk any more, so no save should be suppressed on its behalf.
-    this._persistedIssuances.clear()
+    // Markers deliberately survive this. A save still in flight for a pair we just deleted
+    // has to stay suppressed, or it would write the dead credential straight back.
     debugLog('OAuth tokens invalidated')
   }
 }

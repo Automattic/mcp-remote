@@ -424,17 +424,39 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ refresh_token: 'refresh-2' }))
     })
 
-    it('forgets its markers when the stored tokens are invalidated', async () => {
+    it('does not let a save in flight resurrect tokens that were invalidated', async () => {
       mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
       fetchSpy.mockResolvedValue(tokenResponse(pair('a2', 'refresh-2')))
       await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
 
       await provider.invalidateCredentials('tokens')
 
-      // Nothing this process wrote survives, so a later save must not be suppressed.
+      // The guard decided this pair is dead and deleted it. Its save arriving afterwards
+      // must not write it back.
       mockWriteJsonFile.mockClear()
       await provider.saveTokens(pair('a2', 'refresh-2') as any)
-      expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ access_token: 'a2' }))
+      expect(mockWriteJsonFile).not.toHaveBeenCalled()
+    })
+
+    it('counts repeat issuances of an identical pair', async () => {
+      // A server may answer two refreshes with the same access and refresh token. Collapsing
+      // those markers leaves one save unmatched, and it writes its pair over whatever a later
+      // issuance stored - here reinstating refresh-1, which the third refresh has spent.
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+      fetchSpy.mockResolvedValue(tokenResponse(pair('A', 'refresh-1')))
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+
+      fetchSpy.mockResolvedValue(tokenResponse(pair('B', 'refresh-2')))
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+
+      mockWriteJsonFile.mockClear()
+      // Saves arrive out of order, and both copies of the duplicate pair must be matched.
+      await provider.saveTokens(pair('B', 'refresh-2') as any)
+      await provider.saveTokens(pair('A', 'refresh-1') as any)
+      await provider.saveTokens(pair('A', 'refresh-1') as any)
+
+      expect(mockWriteJsonFile).not.toHaveBeenCalled()
     })
 
     it('runs queued refreshes one at a time', async () => {
