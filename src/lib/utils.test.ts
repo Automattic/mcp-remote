@@ -822,6 +822,80 @@ describe('Feature: MCP Proxy', () => {
     )
   })
 
+  it('Scenario: A failed forward to the server answers the client instead of hanging', async () => {
+    // An OAuth error escaping the SDK's auth retry rejects the send. Without an answer the
+    // client waits on a response that will never come, until its own timeout fires.
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(new Error('The provided authorization grant is invalid')),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    mockTransportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: '7' } as any)
+    await vi.waitFor(() => expect(mockTransportToClient.send).toHaveBeenCalled())
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jsonrpc: '2.0',
+        id: '7',
+        error: expect.objectContaining({
+          code: -32603,
+          message: expect.stringContaining('The provided authorization grant is invalid'),
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: A failed forward of a notification does not fabricate a response', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(new Error('boom')),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    // Notifications carry no id, so there is nothing to answer.
+    mockTransportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/initialized' } as any)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect(mockTransportToClient.send).not.toHaveBeenCalled()
+  })
+
   it('Scenario: Proxy server response back to client', async () => {
     // Given mock transports for client and server
     const mockTransportToClient = {

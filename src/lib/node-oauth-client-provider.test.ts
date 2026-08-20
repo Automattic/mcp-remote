@@ -172,7 +172,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         provider = new NodeOAuthClientProvider(defaultOptions)
       })
 
-      it('deletes tokens when the on-disk refresh token matches the one this process last read', async () => {
+      it('deletes tokens when the on-disk refresh token matches the one this process pinned', async () => {
         mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
         await provider.tokens()
 
@@ -211,16 +211,76 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
       })
 
-      it('treats tokens this process saved itself as its own when guarding invalidation', async () => {
+      it('does not let a hot-path read of a newer token move the pin', async () => {
+        // tokens() is on the SDK's per-request path. This process pins refresh-1 and starts
+        // refreshing with it; a concurrent process wins the rotation and writes refresh-2;
+        // an ordinary request then reads tokens while our refresh is still in flight.
         mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
         await provider.tokens()
-        // This process wins the refresh race and saves the rotated pair.
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+        await provider.tokens()
+
+        await provider.invalidateCredentials('tokens')
+
+        // The pin is still refresh-1, so the winner's live pair survives.
+        expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      })
+
+      it('does not let a concurrent flow saving tokens move the pin', async () => {
+        // Two auth flows in one process share this provider. This flow pinned refresh-1 and
+        // lost the race; the other flow won it and saved the rotated pair.
+        mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
+        await provider.tokens()
         await provider.saveTokens(tokensWith('refresh-2') as any)
         mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
 
         await provider.invalidateCredentials('tokens')
 
-        // Disk matches what we saved, so a later invalid_grant means our grant is dead.
+        expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      })
+
+      it('retires the pin after keeping tokens, so the next attempt can still delete them', async () => {
+        // A kept pair that really is dead must not be kept forever. Cycle one keeps because
+        // the pin is stale; cycle two re-pins from disk, matches, and deletes.
+        mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
+        await provider.tokens()
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+        await provider.invalidateCredentials('tokens')
+        expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+
+        await provider.tokens()
+        await provider.invalidateCredentials('tokens')
+
+        expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      })
+
+      it('retires the pin after deleting tokens', async () => {
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+        await provider.tokens()
+        await provider.invalidateCredentials('tokens')
+
+        // Pin cleared, so a rotation observed only after this point is respected again.
+        await provider.tokens()
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+        mockDeleteConfigFile.mockClear()
+        await provider.invalidateCredentials('tokens')
+
+        expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      })
+
+      it('retires the pin when all credentials are invalidated', async () => {
+        mockReadJsonFile.mockResolvedValueOnce(tokensWith('refresh-1'))
+        await provider.tokens()
+
+        await provider.invalidateCredentials('all')
+
+        // A pin surviving a full wipe would point at a token that no longer exists, and
+        // `??=` cannot correct it because a missing file reads as undefined.
+        mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+        await provider.tokens()
+        mockDeleteConfigFile.mockClear()
+        await provider.invalidateCredentials('tokens')
+
         expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
       })
     })

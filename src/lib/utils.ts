@@ -3,7 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
-import { OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
+import { InvalidGrantError, OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { OAuthClientInformationFull, OAuthClientInformationFullSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
 import { OAuthCallbackServerOptions, StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './types'
 import { getConfigDir, getConfigFilePath, readJsonFile } from './mcp-auth-config'
@@ -32,6 +32,7 @@ declare global {
 // Connection constants
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
+export const REASON_TOKENS_ROTATED = 'tokens-rotated-by-concurrent-process'
 
 // Transport strategy types
 export type TransportStrategy = 'sse-only' | 'http-only' | 'sse-first' | 'http-first'
@@ -226,7 +227,24 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
-    transportToServer.send(message).catch(onServerError)
+    transportToServer.send(message).catch((error) => {
+      onServerError(error)
+
+      // A rejected send leaves the client waiting on a response that will never arrive -
+      // an OAuth error escaping the SDK's auth retry surfaces exactly this way, and the
+      // request hangs until the client's own timeout. Fail it fast instead.
+      if (message.id !== undefined && message.id !== null) {
+        const errorResponse = {
+          jsonrpc: '2.0' as const,
+          id: message.id,
+          error: {
+            code: -32603,
+            message: `Failed to forward request to remote server: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        }
+        transportToClient.send(errorResponse).catch(onClientError)
+      }
+    })
   }
 
   transportToServer.onmessage = (_message) => {
@@ -541,6 +559,30 @@ export async function connectToRemoteServer(
         sseTransport ? 'http-only' : 'sse-only',
         recursionReasons,
       )
+    } else if (error instanceof InvalidGrantError) {
+      // The SDK retries a refresh exactly once after invalid_grant, so losing the rotation
+      // race twice in a row escapes auth() entirely and lands here. By now tokens.json holds
+      // whichever process survived, so one reconnect re-reads it and succeeds. If the grant
+      // really is dead, that retry re-pinned the provider from disk, so the next invalidation
+      // matches, deletes, and takes the normal browser-auth path.
+      if (recursionReasons.has(REASON_TOKENS_ROTATED)) {
+        const errorMessage = `Already attempted reconnection for reason: ${REASON_TOKENS_ROTATED}. Giving up.`
+        log(errorMessage)
+        throw new Error(errorMessage)
+      }
+
+      log('Refresh token was rotated by a concurrent process. Reconnecting with the current tokens...')
+      debugLog('Reconnecting after invalid_grant escaped the SDK auth retry', { errorMessage: error.message })
+
+      // Close the failed transport before recursing, for the same reasons as the auth path.
+      if (client) {
+        await client.close()
+      } else {
+        await transport.close()
+      }
+
+      recursionReasons.add(REASON_TOKENS_ROTATED)
+      return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
       log('Authentication required. Initializing auth...')
       debugLog('Authentication error detected', {
@@ -792,6 +834,10 @@ export async function findAvailablePort(preferredPort?: number): Promise<number>
  * during refresh-token rotation) into an unparseable ServerError ("Raw body: [object
  * Response]"), which the SDK's auth flow silently swallows before falling back to a
  * full browser re-authorization.
+ *
+ * Only these four move. FormData/Blob/File are left on Node's built-ins because nothing
+ * in the OAuth or transport path constructs them - token requests are URLSearchParams -
+ * so aliasing them would widen the blast radius for no benefit.
  */
 function installUndiciGlobals() {
   global.fetch = fetch as unknown as typeof global.fetch

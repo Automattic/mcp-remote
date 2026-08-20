@@ -10,6 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
 
 import { connectToRemoteServer } from './utils'
+import { writeJsonFile } from './mcp-auth-config'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import type { OAuthProviderOptions } from './types'
 
@@ -183,6 +184,114 @@ describe('Feature: OAuth flow end-to-end', () => {
     // Exactly one unauthenticated POST should hit the server — the initial probe. A second
     // would mean we re-probed after auth instead of using the freshly-issued Bearer token.
     expect(unauthenticatedPosts).toBe(1)
+
+    await client.close()
+  }, 15_000)
+
+  it('Scenario: losing the rotation race twice reconnects instead of failing the connection', async () => {
+    // Three processes share one tokens.json against a server with single-use refresh tokens.
+    // This one loses the rotation twice: the SDK retries a refresh exactly once after
+    // invalid_grant, so the second loss escapes auth() entirely. It must reconnect onto the
+    // surviving process's tokens rather than dying or opening a browser.
+    const serverUrlHash = 'rotation-race-test'
+    const mcpServerUrl = mcp.url('/mcp')
+    const resourceMetadataUrl = mcp.url('/per-server/oauth-protected-resource')
+    const goodAccessToken = 'access-after-recovery'
+
+    await writeJsonFile(serverUrlHash, 'tokens.json', {
+      access_token: 'stale-access-token',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      refresh_token: 'refresh-1',
+    })
+
+    mcp.on('POST', '/mcp', (req, res) => {
+      if (req.headers.authorization !== `Bearer ${goodAccessToken}`) {
+        return res
+          .status(401)
+          .header('WWW-Authenticate', `Bearer realm="mcp", resource_metadata="${resourceMetadataUrl}"`)
+          .json({ error: 'Unauthorized' })
+      }
+      const body = req.body
+      const respond = (result: unknown) => res.header('content-type', 'application/json').json({ jsonrpc: '2.0', id: body.id, result })
+      if (body.method === 'initialize') {
+        return respond({
+          protocolVersion: '2025-06-18',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'mock-mcp', version: '0.0.0' },
+        })
+      }
+      if (body.method === 'tools/list') {
+        return respond({ tools: [{ name: 'echo', description: 'echoes input', inputSchema: { type: 'object' } }] })
+      }
+      return res.status(202).end()
+    })
+
+    mcp.on('GET', '/per-server/oauth-protected-resource', (_req, res) => {
+      res.json({ resource: mcpServerUrl, authorization_servers: [idp.baseUrl] })
+    })
+
+    idp.on('GET', '/.well-known/oauth-authorization-server', (_req, res) => {
+      res.json({
+        issuer: idp.baseUrl,
+        authorization_endpoint: idp.url('/authorize'),
+        token_endpoint: idp.url('/token'),
+        response_types_supported: ['code'],
+        code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: ['none'],
+      })
+    })
+
+    // Single-use rotation. The first two presented tokens have already been spent by other
+    // processes, which each left their rotated pair on disk before we got here.
+    const spentBy: Record<string, string> = { 'refresh-1': 'refresh-2', 'refresh-2': 'refresh-3' }
+    const presentedRefreshTokens: string[] = []
+    idp.on('POST', '/token', async (req, res) => {
+      presentedRefreshTokens.push(req.body.refresh_token)
+      const alreadyRotatedTo = spentBy[req.body.refresh_token]
+      if (alreadyRotatedTo) {
+        await writeJsonFile(serverUrlHash, 'tokens.json', {
+          access_token: `access-for-${alreadyRotatedTo}`,
+          token_type: 'Bearer',
+          expires_in: 3600,
+          refresh_token: alreadyRotatedTo,
+        })
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'refresh token already used' })
+      }
+      res.json({ access_token: goodAccessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: 'refresh-4' })
+    })
+
+    const callbackPort = 33420
+    const callbackPath = '/oauth/callback'
+    const authProvider = new NodeOAuthClientProvider(<OAuthProviderOptions>{
+      serverUrl: mcpServerUrl,
+      serverUrlHash,
+      callbackPort,
+      host: 'localhost',
+      callbackPath,
+      staticOAuthClientInfo: {
+        client_id: 'test-client-id',
+        redirect_uris: [`http://localhost:${callbackPort}${callbackPath}`],
+        token_endpoint_auth_method: 'none',
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+      },
+    })
+    const redirectSpy = vi.spyOn(authProvider, 'redirectToAuthorization').mockResolvedValue()
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode: vi.fn(), skipBrowserAuth: false })
+
+    const client = new Client({ name: 'rotation-race-test', version: '0.0.0' }, { capabilities: {} })
+    const transport = await connectToRemoteServer(client, mcpServerUrl, authProvider, {}, authInitializer, 'http-only')
+    expect(transport).toBeDefined()
+
+    const tools = await client.request({ method: 'tools/list' }, ListToolsResultSchema)
+    expect(tools.tools.map((t) => t.name)).toEqual(['echo'])
+
+    // Each attempt presented the token that was current on disk at the time: ours, then the
+    // first winner's, then the second winner's — which finally succeeded.
+    expect(presentedRefreshTokens).toEqual(['refresh-1', 'refresh-2', 'refresh-3'])
+    // No browser. That is the whole point: the credentials were live the entire time.
+    expect(redirectSpy).not.toHaveBeenCalled()
 
     await client.close()
   }, 15_000)
