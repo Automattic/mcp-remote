@@ -23,6 +23,13 @@ import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 const MAX_PERSISTED_TOKEN_MARKERS = 8
 
 /**
+ * Identifies one token issuance. Both halves are needed: a non-rotating server repeats the
+ * refresh token, and OAuth does not require a distinct access token per response either.
+ * The separator is a NUL, which cannot appear in either token.
+ */
+const issuanceKey = (tokens: OAuthTokens) => `${tokens.access_token}\u0000${tokens.refresh_token ?? ''}`
+
+/**
  * Implements the OAuthClientProvider interface for Node.js environments.
  * Handles OAuth flow and token storage for MCP clients.
  */
@@ -40,7 +47,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
   private _clientInfo: OAuthClientInformationFull | undefined
   private _pinnedRefreshToken: string | undefined
   private _refreshQueue: Promise<unknown> = Promise.resolve()
-  private _persistedAccessTokens = new Set<string>()
+  private _persistedIssuances = new Set<string>()
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
@@ -261,15 +268,21 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
       // a null from `body.get` cannot land on disk, where the token schema would reject it.
       const tokens = { ...(submitted ? { refresh_token: submitted } : {}), ...refreshed.data }
 
-      // Persist before releasing the queue so the next refresh in line reads the pair we
-      // just obtained rather than the token we spent.
-      await this.persistTokens(tokens)
-      this.rememberPersistedTokens(tokens.access_token)
+      try {
+        // Persist before releasing the queue so the next refresh in line reads the pair we
+        // just obtained rather than the token we spent. The marker is only recorded once
+        // that write actually landed, so a failure here leaves saveTokens free to retry it.
+        await this.persistTokens(tokens)
+        this.rememberPersistedTokens(tokens)
+      } catch (error) {
+        debugLog('Could not store the refreshed tokens, leaving that to saveTokens', { error: String(error) })
+      }
 
       // Hand the SDK a body naming the refresh token this request actually used.
       // refreshAuthorization backfills the token it *believed* it sent, from a variable our
       // retarget cannot reach, so after a retarget that value is one the server has already
-      // retired - and it is what would otherwise reach saveTokens.
+      // retired. Returned even when the write above failed: saveTokens is then the only
+      // route to disk, and it must not be handed the spent token.
       return new Response(JSON.stringify(tokens), {
         status: response.status,
         statusText: response.statusText,
@@ -278,7 +291,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
         headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' },
       })
     } catch (error) {
-      debugLog('Could not persist the refreshed tokens, leaving that to saveTokens', { error: String(error) })
+      debugLog('Could not read the refresh response, passing it through untouched', { error: String(error) })
       return response
     }
   }
@@ -304,18 +317,21 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
    * Marks an issuance transportFetch has already written, so the matching saveTokens can
    * skip repeating the write.
    *
-   * Keyed on the access token, which is unique per issuance. The refresh token is not: a
-   * server that does not rotate returns the same one every time, so keying on it would
-   * conflate successive issuances and leave a marker matching forever - and the first
-   * refresh whose write failed would then have its saveTokens fallback wrongly skipped.
+   * Keyed on both tokens, because neither alone identifies an issuance. A server that does
+   * not rotate repeats the refresh token, so keying on that would conflate every issuance
+   * and leave a marker matching forever. OAuth does not promise a fresh access token either,
+   * so keying on that would collapse {A,r2} and {A,r3} into one marker - the save for one
+   * would consume it and the save for the other would write a spent token over the newer
+   * pair. Together they differ whenever the issuance differs.
    *
-   * Markers are one-shot, consumed by the matching save. The cap only cleans up after an
-   * issuance whose save never arrived at all, so it just needs to exceed the number of
-   * refreshes that can be awaiting their save at once.
+   * Markers are one-shot, consumed by the matching save. The cap is a leak guard for an
+   * issuance whose save never arrives; refreshes are serialized by queueRefresh and each
+   * save follows its own refresh within microtasks, so the number outstanding at once stays
+   * far below it.
    */
-  private rememberPersistedTokens(accessToken: string): void {
-    const markers = this._persistedAccessTokens
-    markers.add(accessToken)
+  private rememberPersistedTokens(tokens: OAuthTokens): void {
+    const markers = this._persistedIssuances
+    markers.add(issuanceKey(tokens))
     const [oldest] = markers
     if (markers.size > MAX_PERSISTED_TOKEN_MARKERS && oldest) {
       markers.delete(oldest)
@@ -400,7 +416,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
     // the request actually spent. The SDK calls this afterwards, outside that queue, so a
     // refresh that has since rotated past this pair would otherwise be undone by it.
     // Consuming the marker keeps this to the one save that issuance belongs to.
-    if (this._persistedAccessTokens.delete(tokens.access_token)) {
+    if (this._persistedIssuances.delete(issuanceKey(tokens))) {
       debugLog('Skipping saveTokens; the refresh that produced these tokens already stored them')
       return
     }
@@ -478,6 +494,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
         ])
         this._clientInfo = undefined
         this._pinnedRefreshToken = undefined
+        this._persistedIssuances.clear()
         debugLog('All credentials invalidated')
         break
 
@@ -549,6 +566,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TransportFe
     }
 
     await deleteConfigFile(this.serverUrlHash, 'tokens.json')
+    // Nothing we wrote is on disk any more, so no save should be suppressed on its behalf.
+    this._persistedIssuances.clear()
     debugLog('OAuth tokens invalidated')
   }
 }

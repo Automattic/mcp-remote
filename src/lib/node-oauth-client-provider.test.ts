@@ -387,6 +387,56 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ access_token: 'a3' }))
     })
 
+    it('does not confuse two issuances that share an access token', async () => {
+      // OAuth does not promise a fresh access token per refresh. Keying markers on it alone
+      // would collapse {A,r2} and {A,r3} into one, letting the save for the older pair write
+      // a spent refresh token over the newer one.
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+      fetchSpy.mockResolvedValueOnce(tokenResponse(pair('A', 'refresh-2')))
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+      fetchSpy.mockResolvedValueOnce(tokenResponse(pair('A', 'refresh-3')))
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-2') })
+
+      mockWriteJsonFile.mockClear()
+      // The newer save arrives first, then the delayed older one.
+      await provider.saveTokens(pair('A', 'refresh-3') as any)
+      await provider.saveTokens(pair('A', 'refresh-2') as any)
+
+      expect(mockWriteJsonFile).not.toHaveBeenCalled()
+    })
+
+    it('reports the retargeted token even when it cannot store the pair itself', async () => {
+      // Retarget plus an omitted refresh_token plus a failed write: saveTokens is the only
+      // route to disk, so the response it parses must still name the token actually sent.
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-2'))
+      mockWriteJsonFile.mockRejectedValueOnce(new Error('disk full'))
+      fetchSpy.mockResolvedValue(tokenResponse(pair('a3')))
+
+      const response = await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+
+      expect(await response.json()).toMatchObject({ access_token: 'a3', refresh_token: 'refresh-2' })
+
+      // No marker was recorded, so the SDK's save is the write that lands.
+      mockWriteJsonFile.mockClear()
+      await provider.saveTokens(pair('a3', 'refresh-2') as any)
+      expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ refresh_token: 'refresh-2' }))
+    })
+
+    it('forgets its markers when the stored tokens are invalidated', async () => {
+      mockReadJsonFile.mockResolvedValue(tokensWith('refresh-1'))
+      fetchSpy.mockResolvedValue(tokenResponse(pair('a2', 'refresh-2')))
+      await provider.transportFetch(tokenUrl, { method: 'POST', body: refreshBody('refresh-1') })
+
+      await provider.invalidateCredentials('tokens')
+
+      // Nothing this process wrote survives, so a later save must not be suppressed.
+      mockWriteJsonFile.mockClear()
+      await provider.saveTokens(pair('a2', 'refresh-2') as any)
+      expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ access_token: 'a2' }))
+    })
+
     it('runs queued refreshes one at a time', async () => {
       mockReadJsonFile.mockResolvedValue(undefined)
       let inFlight = 0
